@@ -150,18 +150,26 @@ pub(crate) fn media_slots(s:&Shot)->Vec<MediaBox> {
 // appear to be multiple competing "best" cards).
 pub(crate) fn media_search_slots(s:&Shot)->Vec<MediaBox>{
     let mut result=Vec::new();
+    let mut seen=std::collections::HashSet::<(i32,i32)>::new();
+    let media_left=105i32;
+    let media_right=(s.w.min(680)) as i32;
     let media_top=145i32;
     let media_bottom=(s.h.min(575)) as i32;
     for slot in media_slots(s) {
-        for shift in (-84i32..=84).step_by(14) {
-            let shifted=MediaBox {
-                left:slot.left, right:slot.right,
-                top:slot.top+shift, bottom:slot.bottom+shift,
-            };
-            if shifted.top>=media_top && shifted.bottom<=media_bottom {
-                // Prevent duplicate scan candidates from adjacent nominal
-                // rows with the exact same shifted rectangle.
-                if !result.contains(&shifted){result.push(shifted);}
+        // On a row break, CapCut can reflow BOTH horizontally and vertically.
+        // ±70px x-offset includes x181 vs old first-card x120 in user logs.
+        // Candidate dimensions and actual Media bounds are still limited.
+        for dy in (-84i32..=84).step_by(14) {
+            for dx in (-70i32..=70).step_by(14){
+                let shifted=MediaBox{
+                    left:slot.left+dx,right:slot.right+dx,
+                    top:slot.top+dy,bottom:slot.bottom+dy,
+                };
+                if shifted.left>=media_left && shifted.right<=media_right &&
+                   shifted.top>=media_top && shifted.bottom<=media_bottom &&
+                   seen.insert((shifted.left,shifted.top)){
+                    result.push(shifted);
+                }
             }
         }
     }
@@ -418,6 +426,20 @@ mod tests {
         let fourth=MediaBox{left:120,top:458,right:236,bottom:536};
         assert!(candidates.contains(&fourth),"must search shifted row 4 col 1");
         assert!(candidates.iter().all(|r|r.top>=145 && r.bottom<=575));
+    }
+    #[test] fn searches_first_column_when_row_moves_both_axes(){
+        let shot=blank();
+        let candidates=media_search_slots(&shot);
+        // First tile of third row shifts right by 56 and down 28 pixels.
+        let third=MediaBox{left:176,top:402,right:292,bottom:480};
+        assert!(candidates.contains(&third),"search must find reflowed first tile");
+        // First tile of fourth row shifts slightly left and up.
+        let fourth=MediaBox{left:106,top:444,right:222,bottom:522};
+        assert!(candidates.iter().any(|b|
+            b.left>=105 && (b.left-fourth.left).abs()<=7 &&
+            (b.top-fourth.top).abs()<=14));
+        assert!(candidates.iter().all(|b|
+            b.left>=105 && b.right<=680 && b.top>=145 && b.bottom<=575));
     }
     #[test] fn unchanged_media_is_not_clicked() {
         let s=blank(); assert!(find_imported_media(&s,&s).is_none());
