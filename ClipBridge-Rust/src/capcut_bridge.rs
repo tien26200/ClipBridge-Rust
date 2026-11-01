@@ -331,7 +331,7 @@ unsafe fn native_drag_to_playhead(
         return Err("Playhead drop target outside a valid timeline region".into());
     }
     let start=packed_point(from);
-    if PostMessageW(editor,WM_LBUTTONDOWN,MK_LBUTTON as usize,start)==0 {
+    if PostMessageW(editor,WM_LBUTTONDOWN,1usize,start)==0 {
         return Err("Cannot press Media image for playhead placement".into());
     }
     // One local move passes the minimum Qt drag threshold while remaining
@@ -342,7 +342,7 @@ unsafe fn native_drag_to_playhead(
         let px=from.x+(to.x-from.x)*step/18;
         let py=from.y+(to.y-from.y)*step/18;
         let point=POINT{x:px,y:py};
-        if PostMessageW(editor,WM_MOUSEMOVE,MK_LBUTTON as usize,
+        if PostMessageW(editor,WM_MOUSEMOVE,1usize,
             packed_point(point))==0 {
             path_ok=false;
             break;
