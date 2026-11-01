@@ -286,6 +286,24 @@ mod tests {
         assert!((found.slot.top-458).abs()<=14);
         fs::remove_file(png).unwrap();
     }
+    #[test] fn first_new_row_thumbnail_with_horizontal_and_vertical_reflow(){
+        let png=png_for_test();
+        let reference=Reference::from_png(&png).unwrap();
+        let before=Shot::for_test(700,590);
+        let mut after=Shot::for_test(700,590);
+        // Imported B occupies first Media tile of a new row. CapCut has
+        // moved the left edge by 56px and row by 28px from nominal anchors.
+        let new_card=MediaBox{left:176,top:402,right:292,bottom:480};
+        after.paint_for_test(new_card,(20,70,220));
+        let found=reference.locate(Some(&before),&after)
+            .expect("new-row image must be located by content, not old anchor");
+        assert!((found.slot.left-new_card.left).abs()<=14,
+            "wrong new-row x: {}",found.slot.left);
+        assert!((found.slot.top-new_card.top).abs()<=14,
+            "wrong new-row y: {}",found.slot.top);
+        assert!(found.loss<0.15,"expected source content match, loss={}",found.loss);
+        fs::remove_file(png).unwrap();
+    }
     #[test] fn unchanged_screen_does_not_claim_new_import(){
         let path=png_for_test();
         let reference=Reference::from_png(&path).unwrap();
