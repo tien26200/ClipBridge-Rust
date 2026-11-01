@@ -1,52 +1,46 @@
-# ClipBridge Rust v0.7.8
+# ClipBridge Rust v0.7.9
 
-Windows clipboard image → saved PNG → hidden CapCut import → optional
-Add-to-Track in the CapCut editor, **without moving the physical pointer**.
+## Fix — first image when CapCut Media starts a new row
 
-## v0.7.8 second-picture safety fix
+The user identified that the FIRST thumbnail in a newly filled Media row
+often imports correctly into Media but is not added to timeline. Previous
+ClipBridge builds assumed all thumbnails stayed on a rigid 136px-by-112px
+grid. CapCut can scroll/reflow the Media panel when a row fills; a changed
+rectangle may not be the newly imported thumbnail.
 
-Based on the supplied `clipbridge.log`:
-- Image A (sequence 570) was imported and its Add (+) message posted.
-- Image B (sequence 579) was imported but Media identification failed
-  after 22 screenshots, with multiple reflowing Media slots.
-- Pressing Ctrl+V again re-imported B, creating duplicate Media candidates.
+v0.7.9:
+1. Adds a bounded ±84px vertical scan in 14px steps around each known
+   Media grid anchor (only fully visible parts of the Media panel).
+2. Scores those candidates against the *actual saved PNG* source, rather
+   than trusting changed pixels alone. It collapses nearby scan offsets
+   from the SAME thumbnail before calculating the confidence margin.
+3. Logs the source match confidence and row offset as numbers, without
+   logging image content or screenshots.
+4. If selecting the new thumbnail causes CapCut to scroll again, re-runs
+   source matching against the CURRENT screen and confirms the selection
+   still belongs to the source before clicking Add (+).
+5. Keeps the exact v0.7.4 low-level Add-to-Track down/up message pair,
+   and the v0.7.8 no-duplicate re-import state machine.
 
-To address this, the image worker tracks the current clipboard sequence
-and saved PNG path, plus whether Import or Add was already attempted.
-It now checks visible Media cards against a sparse RGB histogram decoded
-from that exact saved PNG. This match is approximate, so the app will
-fail closed if images are too similar, offscreen, or the UI is ambiguous.
-A conservative selection-based fallback remains for the first import.
-If the newly imported thumbnail is not selected, ClipBridge selects and
-confirms that exact card before posting the Add (+) message.
+The algorithm deliberately fails closed on ambiguous or offscreen media
+rather than pressing Add (+) on an older image. No Windows mouse pointer
+movement, no edits to CapCut drafts.
 
-If the first Import succeeded but Add could not be identified, the next
-Ctrl+V of the SAME clipboard sequence searches Media again **without**
-re-importing B. If an Add command was posted, a repeat Ctrl+V does not
-post another Add: copy the source image again if intentional repeat is
-needed, to avoid accidentally adding duplicate timeline clips.
-No global clipboard clearing, CapCut draft edits or physical cursor moves.
+## Filename when copying images
 
-**Status is intentionally 'Add command sent, not verified'.** There is
-no verified direct timeline API or reliable proof from one HWND message
-that CapCut inserted a clip. Test in a disposable CapCut project.
-
-## PNG filename, at time of Ctrl+C
-
-New image copies are saved as
-`TenProject_001_DD-MM-YYYY.png`,
-`TenProject_002_DD-MM-YYYY.png`, etc. Existing files are never renamed
-or overwritten. If automatic read-only CapCut project name detection
-cannot determine the active draft, use the optional manual project
-name field in ClipBridge. CapCut Media asset names are not edited.
+ClipBridge saves PNGs as `TenProject_001_DD-MM-YYYY.png`, numbered per
+project/day when Ctrl+C fires outside CapCut. Existing files are never
+renamed or overwritten. If automatic project detection is not accurate,
+provide a manual name in ClipBridge's window.
 
 ## Settings
-- **Tự thêm ảnh vào CapCut khi Ctrl+V** — ON by default.
-- **Chặn Ctrl+V gốc khi thêm ảnh mới** — ON (recommended).
-- **Clear Windows Clipboard after Add command** — OFF. This option clears
-  only Windows Clipboard, not older Media assets; keep it OFF for testing.
 
-Settings persist at `%LOCALAPPDATA%\ClipBridge\preferences.ini`.
-The app retains its small tri-colour circular Windows/tray icon.
-Diagnostics: `%LOCALAPPDATA%\ClipBridge\clipbridge.log`.
-Refer to `VALIDATION.md` for detailed regression scenarios.
+- Auto Add on Ctrl+V (ON by default)
+- Block native CapCut Ctrl+V for new copied image (ON by default)
+- Optionally clear Windows Clipboard after sending Add (OFF by default)
+- Circular pink/blue/yellow Windows/tray icon unchanged.
+
+Settings and diagnostic log live in `%LOCALAPPDATA%\ClipBridge`.
+This is Windows GUI automation, not a verified CapCut API.
+A successful test/build is not proof a clip was inserted into timeline.
+Run the checks in `VALIDATION.md` on a disposable CapCut project.
