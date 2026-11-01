@@ -239,7 +239,9 @@ pub fn store_png(bytes: &[u8], folder: &Path) -> Result<PathBuf, String> {
             .open(&temp)
             .map_err(|e| e.to_string())?;
         f.write_all(bytes).map_err(|e| e.to_string())?;
-        f.sync_data().map_err(|e| e.to_string())?;
+        // The temp file is renamed only after the write succeeds. Avoid a
+        // forced disk flush for every clipboard image: it can stall on HDDs,
+        // network shares and antivirus-scanned directories.
         drop(f);
         fs::rename(&temp, &path).map_err(|e| e.to_string())?;
         Ok(path)
