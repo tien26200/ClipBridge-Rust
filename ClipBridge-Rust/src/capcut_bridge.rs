@@ -17,6 +17,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::ScreenToClient,
+    System::DataExchange::GetClipboardSequenceNumber,
     UI::{
         Accessibility::*,
         Input::KeyboardAndMouse::*,
@@ -272,6 +273,9 @@ pub unsafe fn import_then_add(
         return Err("CapCut no longer foreground or target window changed".into());
     }
     if !job.image.is_file(){return Err("Copied image not found on disk".into());}
+    if GetClipboardSequenceNumber()!=job.sequence {
+        return Err("Clipboard changed before import; refusing to add a stale image".into());
+    }
     // Wait until the user's physical Ctrl+V is released before Ctrl+I.
     let deadline=Instant::now()+Duration::from_millis(800);
     while Instant::now()<deadline &&
@@ -300,6 +304,9 @@ pub unsafe fn import_then_add(
     trace(&format!("MEDIA_TILE_FOUND x={} y={} diff={score:.1}",box_.right,box_.bottom));
     if !editor_is_foreground(editor) {
         return Err("Focus changed before Add-to-Track; no click sent".into());
+    }
+    if GetClipboardSequenceNumber()!=job.sequence {
+        return Err("Clipboard changed during import; refusing to add a stale image".into());
     }
     native_add_to_track(editor,box_)?;
     trace("ADD_TO_TRACK_COMMAND_SENT_NOT_VERIFIED");
