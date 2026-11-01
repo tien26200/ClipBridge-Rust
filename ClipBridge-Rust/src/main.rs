@@ -15,7 +15,7 @@ use std::{
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     ptr::{null, null_mut},
-    sync::mpsc::{self, SyncSender},
+    sync::{mpsc::{self, SyncSender}, atomic::{AtomicBool, AtomicU32, AtomicIsize, Ordering}},
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -328,25 +328,50 @@ unsafe fn capture(app: &mut App) {
     }
 }
 
-// Ctrl+V observer is deliberately passive: it never blocks Windows paste.
-// All CapCut project operations are deferred to a future verified adapter.
-static PASTE_TARGET: std::sync::atomic::AtomicIsize =
-    std::sync::atomic::AtomicIsize::new(0);
+// Intercept only paste of the current external image in CapCut.
+// Previously the passive hook allowed CapCut to paste an OLD internal Media
+// object, then our importer added the NEW image, creating two timeline clips.
+// Text, unrelated applications and internal CapCut copy remain pass-through.
+static PASTE_TARGET: AtomicIsize = AtomicIsize::new(0);
+static PASTE_IMAGE_SEQ: AtomicU32 = AtomicU32::new(0);
+static PASTE_AUTOMATION: AtomicBool = AtomicBool::new(false);
+static PASTE_V_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 const WM_PASTE_OBSERVED: u32 = WM_APP + 3;
 
 unsafe extern "system" fn paste_observer(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if code >= 0 && (w as u32 == WM_KEYDOWN || w as u32 == WM_SYSKEYDOWN) {
-        let k = &*(l as *const KBDLLHOOKSTRUCT);
-        if k.vkCode == b'V' as u32 && (k.flags & LLKHF_INJECTED) == 0
-            && (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0
-        {
-            let target = PASTE_TARGET.load(std::sync::atomic::Ordering::Relaxed) as HWND;
-            if !target.is_null() {
-                PostMessageW(target, WM_PASTE_OBSERVED, 0, 0);
+    if code < 0 {return CallNextHookEx(null_mut(),code,w,l);}
+    let k = &*(l as *const KBDLLHOOKSTRUCT);
+    if k.vkCode != b'V' as u32 || (k.flags & LLKHF_INJECTED)!=0 {
+        return CallNextHookEx(null_mut(),code,w,l);
+    }
+    let key_down=w as u32==WM_KEYDOWN || w as u32==WM_SYSKEYDOWN;
+    let key_up=w as u32==WM_KEYUP || w as u32==WM_SYSKEYUP;
+    if key_up {
+        if PASTE_V_SUPPRESSED.swap(false,Ordering::Relaxed) {return 1;}
+        return CallNextHookEx(null_mut(),code,w,l);
+    }
+    if key_down && PASTE_V_SUPPRESSED.load(Ordering::Relaxed) {
+        // Ignore key repeat for a single physical V press.
+        return 1;
+    }
+    if key_down
+        && PASTE_AUTOMATION.load(Ordering::Relaxed)
+        && (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000)!=0
+    {
+        let seq=GetClipboardSequenceNumber();
+        if seq!=0 && seq==PASTE_IMAGE_SEQ.load(Ordering::Relaxed) {
+            if focused_capcut().is_some() {
+                let target=PASTE_TARGET.load(Ordering::Relaxed) as HWND;
+                // Only swallow the original keyboard event after it is queued.
+                if !target.is_null() &&
+                    PostMessageW(target,WM_PASTE_OBSERVED,seq as usize,0)!=0 {
+                    PASTE_V_SUPPRESSED.store(true,Ordering::Relaxed);
+                    return 1;
+                }
             }
         }
     }
-    CallNextHookEx(null_mut(), code, w, l)
+    CallNextHookEx(null_mut(),code,w,l)
 }
 unsafe fn focused_capcut() -> Option<(usize,u32)> {
     let hwnd=GetForegroundWindow();
@@ -474,6 +499,7 @@ unsafe fn copy_path(app: &mut App) {
     match write_path(app.main, path) {
         Ok(()) => {
             app.last_seq = GetClipboardSequenceNumber();
+            PASTE_IMAGE_SEQ.store(0,Ordering::Relaxed);
             log_event(&app.log_tx, "MANUAL_COPY_PATH success clipboard_replaced=true");
             text(app.status, "Đã copy đường dẫn dạng text (clipboard ảnh gốc đã được thay).");
         }
@@ -486,6 +512,7 @@ fn newer_or_same_sequence(candidate: u32, previous: u32) -> bool {
 
 unsafe fn pause(app: &mut App) {
     app.paused = !app.paused;
+    PASTE_AUTOMATION.store(!app.paused && app.import_enabled,Ordering::Relaxed);
     log_event(&app.log_tx, format!("PAUSE changed={}", app.paused));
     text(
         app.pause,
@@ -734,10 +761,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
         WM_PASTE_OBSERVED => {
             let a=&mut *p;
-            if !a.paused && a.import_enabled {
+            let seq=w as u32;
+            if !a.paused && a.import_enabled && seq==GetClipboardSequenceNumber() {
                 if let Some((editor,pid))=focused_capcut() {
-                    let seq=GetClipboardSequenceNumber();
-                    // Do not hijack a later text copy or CapCut's internal media copy.
+                    // The hook suppressed physical Ctrl+V, preventing
+                    // CapCut from pasting its previous internal Media object.
+                    log_event(&a.log_tx,format!("CAPCUT_CTRL_V_SUPPRESSED seq={seq} native_paste_blocked=true"));
                     if a.latest_sequence==Some(seq) {
                         if let Some(path)=a.latest.clone(){
                             enqueue_import(a,editor,pid,seq,path);
@@ -800,6 +829,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     if a.latest_sequence.is_none_or(|prev| newer_or_same_sequence(sequence, prev)) {
                         a.latest = Some(path.clone());
                         a.latest_sequence = Some(sequence);
+                        if GetClipboardSequenceNumber()==sequence {
+                            PASTE_IMAGE_SEQ.store(sequence,Ordering::Relaxed);
+                        }
                         log_event(&a.log_tx, format!("SAVE_OK seq={sequence} filename={} clipboard_current_seq={} unchanged_by_app=true", path.file_name().unwrap_or_default().to_string_lossy(), GetClipboardSequenceNumber()));
                         text(a.status, &format!("Đã lưu PNG: {} (giữ clipboard ảnh gốc)", path.display()));
                         a.timeline.on_image_saved(sequence, path.clone());
@@ -835,6 +867,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 AUTO_ADD => {
                     let a=&mut *p;
                     a.import_enabled=!a.import_enabled;
+                    PASTE_AUTOMATION.store(!a.paused && a.import_enabled,Ordering::Relaxed);
                     log_event(&a.log_tx,format!("AUTO_ADD enabled={}",a.import_enabled));
                     if !a.import_enabled {a.pending_import=None;}
                 },
@@ -880,7 +913,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             if a.clipboard_registered {
                 RemoveClipboardFormatListener(hwnd);
             }
-            PASTE_TARGET.store(0, std::sync::atomic::Ordering::Relaxed);
+            PASTE_AUTOMATION.store(false,Ordering::Relaxed);
+            PASTE_IMAGE_SEQ.store(0,Ordering::Relaxed);
+            PASTE_TARGET.store(0,Ordering::Relaxed);
             if !a.keyboard_hook.is_null() { UnhookWindowsHookEx(a.keyboard_hook); a.keyboard_hook = null_mut(); }
             if a.tray.uID != 0 {
                 Shell_NotifyIconW(NIM_DELETE, &a.tray);
@@ -941,7 +976,7 @@ fn main() {
         let (import_tx, import_rx) = mpsc::sync_channel::<ImportJob>(1);
         let log_path = logger_path();
         let (log_tx, log_thread) = start_logger(log_path.clone());
-        log_event(&log_tx, "START version=0.7.1 capcut_mode=hidden_import_add_to_track clipboard_auto_write=false");
+        log_event(&log_tx, "START version=0.7.2 capcut_mode=hidden_import_add_to_track clipboard_auto_write=false");
         let mut app = Box::new(App {
             folder,
             config,
@@ -1021,9 +1056,10 @@ fn main() {
         );
         SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon_large as isize);
         window_shadow(hwnd);
-        PASTE_TARGET.store(hwnd as isize, std::sync::atomic::Ordering::Relaxed);
+        PASTE_TARGET.store(hwnd as isize,Ordering::Relaxed);
+        PASTE_AUTOMATION.store(app.import_enabled && !app.paused,Ordering::Relaxed);
         app.keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(paste_observer), instance, 0);
-        log_event(&app.log_tx, format!("PASTE_OBSERVER installed={} passive=true", !app.keyboard_hook.is_null()));
+        log_event(&app.log_tx, format!("PASTE_ROUTER installed={} conditional_suppress=true", !app.keyboard_hook.is_null()));
         let target = hwnd as usize;
         let worker_log = log_tx.clone();
         let import_log=log_tx.clone();
