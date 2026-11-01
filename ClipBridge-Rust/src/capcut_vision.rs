@@ -148,7 +148,9 @@ pub fn find_imported_media(before:&Shot,after:&Shot)->Option<(MediaBox,f64)> {
         // A matching selection outline + a clear tile-content difference is
         // stronger evidence than the outline moving to a different slot.
         if changed_rect.overlaps(selected) && score>=8.0 {
-            return Some((selected,score));
+            // The cyan outline may extend beyond the real tile bounds.
+            // Always use the aligned thumbnail rectangle for the (+) hotspot.
+            return Some((changed_rect,score));
         }
     }
     // If no selection moved and the strongest changed tile is elsewhere,
@@ -208,6 +210,22 @@ mod tests {
         draw_rect(&mut shot,rect,(45,107,75));
         draw_outline(&mut shot,rect);
         assert!(find_imported_media(&shot,&shot).is_none());
+    }
+    #[test] fn second_import_uses_second_tile_button_not_old_selection(){
+        let mut before=blank();
+        let mut after=blank();
+        let first=MediaBox {left:120,top:150,right:236,bottom:228};
+        let second=MediaBox {left:256,top:150,right:372,bottom:228};
+        draw_rect(&mut before,first,(150,50,50));
+        draw_rect(&mut after,first,(150,50,50));
+        draw_rect(&mut after,second,(40,210,90));
+        // First tile stays selected; the second newly imported tile is
+        // detected by its own grid slot, not the stale selected rectangle.
+        draw_outline(&mut before,first);
+        draw_outline(&mut after,first);
+        let (got,score)=find_imported_media(&before,&after).unwrap();
+        assert!(score>20.0,"score={score}");
+        assert_eq!(got,second);
     }
     #[test] fn unchanged_media_is_not_clicked() {
         let s=blank(); assert!(find_imported_media(&s,&s).is_none());
