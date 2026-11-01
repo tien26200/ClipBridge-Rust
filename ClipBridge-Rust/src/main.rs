@@ -803,8 +803,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         log_event(&a.log_tx, format!("SAVE_OK seq={sequence} filename={} clipboard_current_seq={} unchanged_by_app=true", path.file_name().unwrap_or_default().to_string_lossy(), GetClipboardSequenceNumber()));
                         text(a.status, &format!("Đã lưu PNG: {} (giữ clipboard ảnh gốc)", path.display()));
                         a.timeline.on_image_saved(sequence, path.clone());
-                        if let Some((wanted,editor,pid))=a.pending_import.take(){
+                        if let Some(&(wanted,editor,pid))=a.pending_import.as_ref(){
                             if wanted==sequence {
+                                a.pending_import=None;
                                 enqueue_import(a,editor,pid,sequence,path);
                             }
                         }
