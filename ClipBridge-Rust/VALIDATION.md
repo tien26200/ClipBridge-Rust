@@ -1,48 +1,60 @@
-# ClipBridge Rust v0.7.9 — row boundary / first column regression
+# ClipBridge Rust v0.8.0 — regression and playhead placement
 
-## Reported real-world symptom
-The first newly imported thumbnail on a NEW row in CapCut's Media view
-appears in Media but cannot be added to the timeline by ClipBridge.
-This is a position-related failure, rather than necessarily image B.
+## Two separate issues reported
+(1) New Media rows: the first image in row 2/3/4 appears in Media but
+does not reliably reach timeline. v0.7.9 added dynamically shifted row
+scans and source-image matching; user's CapCut still showed failures.
 
-## Changes
-- Search ±84 vertical pixels around each expected thumbnail row,
-  constrained to fully visible Media area. Do not assume the old
-  grid y-coordinate is the current visible y-coordinate.
-- Compare sampled Media candidates against the saved PNG RGB histogram.
-- Group adjacent scan offsets belonging to one physical thumbnail before
-  computing margin, otherwise adjacent offsets can falsely be interpreted
-  as multiple independent pictures.
-- Keep confirmation across two screenshots.
-- After selecting thumbnail, *re-find* source on the current UI frame;
-  CapCut may have scrolled again during selection. Confirm the selected
-  rectangle belongs to the source before pressing Add (+).
-- Preserve per-image no-duplicate Import state and original direct click.
-- No image pixels are saved; logs contain coordinates and confidence only.
+(2) Even when a thumbnail reaches timeline, v0.7.9 ignores playhead
+position entirely. The '+' action does not guarantee placement at the
+user's requested time.
 
-## Must test in CapCut itself
-1. Exit old ClipBridge from tray; launch v0.7.9.
-2. Set Auto Add ON; Block Native ON; Clear Clipboard OFF.
-3. Start a disposable project, show Media panel and keep its width fixed.
-4. Copy/paste enough DIFFERENT PNGs to fill row 1.
-5. Copy/paste the FIRST photo of row 2; check that it enters both Media
-   and timeline, not only Media.
-6. Repeat at the FIRST photo of rows 3 and 4, and after deleting an old
-   Media item or after CapCut scrolls the list.
-7. Retry Ctrl+V after unsuccessful Import: should try existing Media
-   without reimporting duplicated PNGs.
-8. Check names `Project_001_DD-MM-YYYY.png` continue incrementing,
-   Settings persist and the three-colour circular icon is unchanged.
-9. If it fails, share
-   `%LOCALAPPDATA%\ClipBridge\clipbridge.log`. Search the failing seq for
-   `MEDIA_SOURCE_DIAGNOSTIC`, `MEDIA_ROW_REFLOW`,
-   `MEDIA_SELECTION_RELOCATED`, `MEDIA_SELECT_CONFIRMED`,
-   `MEDIA_SELECT_NOT_CONFIRMED`, `ADD_TO_TRACK_SENT` and `IMPORT_FAILED`.
-10. A command logged as ADD_TO_TRACK_SENT means only the HWND click was
-    posted. It does NOT verify a new timeline clip was actually created.
+## Implementation (v0.8.0)
+- Playhead placement ON by default. Before importing any image, capture
+  the full editor IN MEMORY and detect a neutral vertical line PLUS
+  corresponding bright marker in the ruler. Require a unique match.
+- Find a likely empty track destination around x=playhead, y in the
+  visible lower timeline region. Refuse to insert on occupied/unclear lane.
+- Import Media and select source-matched thumbnail, as before.
+- Re-identify playhead and empty lane before sending the final action.
+  Abort if playhead moved during import, instead of dropping at wrong time.
+- Attempt a window-scoped synthetic media-to-playhead drag, without
+  moving the user's physical mouse cursor.
+- After drag, compare pixel change in a small timeline patch, but
+  deliberately label as NOT VERIFIED.
+- Toggle playhead checkbox OFF to switch to the legacy Media '+' action.
+  The old action may produce incorrect time placement; it exists for
+  compatibility and easier A/B diagnosis.
+- Keep clipboard image sequence tracking, do not reimport same PNG on
+  retry, do not auto duplicate a posted Add/drag command.
+- Keep project-STT-localdate source PNG filenames, Settings and 3-color icon.
 
-## Limits
-The source match is an approximate RGB histogram, not an exact identity
-proof. Media thumbnails must remain visible and sufficiently distinguishable
-in CapCut's specific version, zoom and layout. It may refuse to add when
-several candidates look similar. The executable is unsigned.
+## CapCut live test — required
+1. Close all older ClipBridge instances and use an expendable CapCut draft.
+2. Set Auto Add ON, Block Native ON, Clear Clipboard OFF.
+3. Check "Đặt ảnh tại playhead (thử nghiệm...)" ON.
+4. Pause playback and move the playhead to a clearly visible time in
+   an EMPTY section of the timeline; keep editor maximized.
+5. Copy distinct image A outside CapCut and Ctrl+V once.
+   Confirm A is in Media AND its timeline clip starts at playhead.
+6. Move playhead to a different time, copy image B and Ctrl+V.
+   Confirm B starts at THAT new playhead time.
+7. Fill first Media row; test first image in second and third Media row.
+8. If preflight cannot detect playhead, no image will be imported in
+   playhead mode; this is intentionally safe. Toggle playhead OFF to
+   try old '+' mode and distinguish regression.
+9. After test, share latest
+   `%LOCALAPPDATA%\ClipBridge\clipbridge.log` and screenshot of
+   editor with Media, timeline, and playhead visible.
+10. Relevant log events:
+    `PLAYHEAD_PRECHECK`, `MEDIA_SOURCE_DIAGNOSTIC`,
+    `MEDIA_ROW_REFLOW`, `PLAYHEAD_DRAG_STARTED`,
+    `PLAYHEAD_DRAG_SENT`, `PLAYHEAD_DRAG_NO_VISIBLE_TIMELINE_CHANGE`,
+    `IMPORT_PLACEMENT_COMMAND_SENT`, `IMPORT_FAILED`.
+
+## Honesty/limitations
+No automated test can verify CapCut's own Qt drag-and-drop response or
+guarantee frame-exact placement for the user's version. Pixel comparison
+is diagnostic, not definitive success evidence. No real pointer movement,
+no screenshot files, no clipboard rewriting, no draft edits.
+EXE is unsigned; scan before running.
