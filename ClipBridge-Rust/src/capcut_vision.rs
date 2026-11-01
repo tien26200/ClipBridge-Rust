@@ -212,6 +212,18 @@ mod tests {
         draw_outline(&mut shot,rect);
         assert!(find_imported_media(&shot,&shot).is_none());
     }
+    #[test] fn selected_thumbnail_geometry_is_used_for_first_import(){
+        let before=blank();
+        let mut after=blank();
+        let tile=MediaBox{left:120,top:150,right:236,bottom:228};
+        draw_rect(&mut after,tile,(210,40,30));
+        draw_outline(&mut after,tile);
+        let selected=selected_media(&after).expect("selected tile must be visible");
+        let (got,_)=find_imported_media(&before,&after)
+            .expect("new media tile must be detected");
+        assert_eq!(got,selected,
+            "v0.7.5 regression: grid rectangle displaced the (+) hit target");
+    }
     #[test] fn second_import_uses_second_tile_button_not_old_selection(){
         let mut before=blank();
         let mut after=blank();
