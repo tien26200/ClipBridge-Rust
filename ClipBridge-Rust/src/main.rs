@@ -4,6 +4,7 @@ mod timeline_bridge;
 mod capcut_bridge;
 mod capcut_vision;
 mod media_reference;
+mod timeline_vision;
 mod project_name;
 use timeline_bridge::{TimelineBridge, UnsupportedCapCutAdapter};
 use capcut_bridge::ImportJob;
@@ -43,6 +44,7 @@ const AUTO_ADD: isize = 112;
 const BLOCK_NATIVE: isize = 113;
 const CLEAR_AFTER: isize = 114;
 const PROJECT_NAME_SAVE: isize = 115;
+const PLAYHEAD_MODE: isize = 116;
 const WM_IMPORT_FINISHED: u32 = WM_APP + 4;
 const LOG_LIMIT: u64 = 2 * 1024 * 1024;
 struct Job {
@@ -97,6 +99,8 @@ struct App {
     project_edit: HWND,
     block_native: bool,
     clear_after_import: bool,
+    playhead_mode: bool,
+    playhead_checkbox: HWND,
     latest: Option<PathBuf>,
     latest_sequence: Option<u32>,
     image_progress: Option<ImageProgress>,
@@ -144,10 +148,11 @@ struct PastePreferences {
     auto_add: bool,
     block_native: bool,
     clear_after_import: bool,
+    playhead_mode: bool,
 }
 impl Default for PastePreferences {
     fn default()->Self {
-        Self {auto_add:true,block_native:true,clear_after_import:false}
+        Self {auto_add:true,block_native:true,clear_after_import:false,playhead_mode:true}
     }
 }
 fn prefs_path()->PathBuf {
@@ -162,6 +167,7 @@ fn parse_preferences(text:&str)->PastePreferences {
             "auto_add"=>p.auto_add=val,
             "block_native"=>p.block_native=val,
             "clear_after_import"=>p.clear_after_import=val,
+            "playhead_mode"=>p.playhead_mode=val,
             _=>{}
         }
     }
@@ -176,8 +182,8 @@ fn save_preferences(a:&App)->Result<(),String>{
         fs::create_dir_all(dir).map_err(|e|e.to_string())?;
     }
     fs::write(&a.preferences,format!(
-        "auto_add={}\nblock_native={}\nclear_after_import={}\n",
-        a.import_enabled,a.block_native,a.clear_after_import
+        "auto_add={}\nblock_native={}\nclear_after_import={}\nplayhead_mode={}\n",
+        a.import_enabled,a.block_native,a.clear_after_import,a.playhead_mode
     )).map_err(|e|e.to_string())
 }
 #[cfg(test)]
@@ -185,19 +191,20 @@ mod preferences_tests {
     use super::{PastePreferences,parse_preferences,is_image_paste_eligible};
     #[test] fn defaults_protect_from_stale_capcut_copy() {
         assert_eq!(parse_preferences(""),PastePreferences {
-            auto_add:true,block_native:true,clear_after_import:false
+            auto_add:true,block_native:true,clear_after_import:false,playhead_mode:true
         });
     }
     #[test] fn settings_can_be_independently_ticked() {
         assert_eq!(parse_preferences("block_native=false\nclear_after_import=true\n"),
-            PastePreferences{auto_add:true,block_native:false,clear_after_import:true});
+            PastePreferences{auto_add:true,block_native:false,clear_after_import:true,playhead_mode:true});
         assert_eq!(parse_preferences("auto_add=false\nblock_native=true\nclear_after_import=true\n"),
-            PastePreferences{auto_add:false,block_native:true,clear_after_import:true});
+            PastePreferences{auto_add:false,block_native:true,clear_after_import:true,playhead_mode:true});
         assert!(is_image_paste_eligible(true,42,42));
     }
     #[test] fn unrecognized_values_do_not_disable_protection(){
         assert!(parse_preferences("block_native=hello").block_native);
         assert!(!parse_preferences("clear_after_import=maybe").clear_after_import);
+        assert!(!parse_preferences("playhead_mode=false").playhead_mode);
     }
 }
 fn start_logger(path: PathBuf) -> (SyncSender<String>, std::thread::JoinHandle<()>) {
@@ -573,11 +580,12 @@ unsafe fn enqueue_import(a:&mut App,editor:usize,pid:u32,sequence:u32,path:PathB
         log_event(&a.log_tx,"IMPORT_SKIPPED reason=clipboard_changed_or_file_missing");
         return;
     }
-    match a.import_tx.try_send(ImportJob {editor,pid,image:path,sequence,reuse_media}) {
+    let at_playhead=a.playhead_mode;
+    match a.import_tx.try_send(ImportJob {editor,pid,image:path,sequence,reuse_media,at_playhead}) {
         Ok(()) => {
             a.import_busy=true;
             a.last_import_attempt=Some(Instant::now());
-            log_event(&a.log_tx,format!("IMPORT_QUEUED seq={sequence} pid={pid} reuse_media={reuse_media}"));
+            log_event(&a.log_tx,format!("IMPORT_QUEUED seq={sequence} pid={pid} reuse_media={reuse_media} at_playhead={at_playhead}"));
             text(a.status,if reuse_media {
                 "Đang tìm ảnh đã Import trong Media; không Import trùng…"
             }else {
@@ -938,24 +946,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 CLEAR_AFTER,38,408,630,28,BS_AUTOCHECKBOX as u32|WS_TABSTOP);
             SendMessageW(a.clear_checkbox,BM_SETCHECK,if a.clear_after_import{1}else{0},0);
             control(hwnd, "BUTTON", "Thoát", EXIT, 575, 280, 95, 32, WS_TABSTOP);
-            control(
-                hwnd,
-                "STATIC",
-                "Clear chỉ xóa clipboard Windows sau khi gửi nút +; không xóa Media/PNG cũ.",
-                0,
-                38,
-                442,
-                640,
-                26,
-                0,
-            );
+            a.playhead_checkbox=control(hwnd,"BUTTON",
+                "Đặt ảnh tại playhead (thử nghiệm, không di chuyển chuột thật)",
+                PLAYHEAD_MODE,38,442,630,28,BS_AUTOCHECKBOX as u32|WS_TABSTOP);
+            SendMessageW(a.playhead_checkbox,BM_SETCHECK,
+                if a.playhead_mode{1}else{0},0);
+            control(hwnd,"STATIC",
+                "Bật: kiểm tra playhead rồi kéo ảnh. Tắt: nút + cũ (có thể sai vị trí).",
+                0,38,472,640,25,0);
             control(hwnd,"STATIC",
                 "Tên project cho file PNG (để trống = tự nhận diện CapCut)",
-                0,20,479,650,22,0);
+                0,20,505,650,22,0);
             a.project_edit=control(hwnd,"EDIT",&a.manual_project,0,
-                20,506,505,29,WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL as u32);
+                20,532,505,29,WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL as u32);
             control(hwnd,"BUTTON","Lưu tên project",
-                PROJECT_NAME_SAVE,535,506,135,29,WS_TABSTOP);
+                PROJECT_NAME_SAVE,535,532,135,29,WS_TABSTOP);
             a.clipboard_registered = AddClipboardFormatListener(hwnd) != 0;
             log_event(&a.log_tx, format!("LISTENER registered={}", a.clipboard_registered));
             if !a.clipboard_registered {
@@ -1008,7 +1013,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             match result {
                 Ok(info)=>{
                     log_event(&a.log_tx,format!(
-                        "IMPORT_ADD_COMMAND_SENT seq={sequence} ms={} bbox={},{},{},{} visual_score={:.1} result_not_confirmed",
+                        "IMPORT_PLACEMENT_COMMAND_SENT seq={sequence} mode={} playhead_x={:?} timeline_patch_change={:?} ms={} bbox={},{},{},{} visual_score={:.1} result_not_confirmed",
+                        info.placement,info.playhead_x,info.timeline_visual_change,
                         info.elapsed_ms,info.box_.left,info.box_.top,info.box_.right,info.box_.bottom,info.visual_change));
                     if a.clear_after_import {
                         match clear_clipboard_if_unchanged(a,sequence) {
@@ -1019,7 +1025,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                             Err(e)=>log_event(&a.log_tx,format!("CLIPBOARD_CLEAR_FAILED seq={sequence} {e}")),
                         }
                     }
-                    text(a.status,"Đã gửi lệnh + cho đúng ảnh Media. Chưa xác minh clip trên timeline; kiểm tra CapCut.");
+                    text(a.status,if info.placement=="playhead_drag"{
+                        if info.timeline_visual_change.unwrap_or(0.0)<4.5 {
+                            "Đã gửi thao tác kéo vào playhead nhưng chưa thấy timeline thay đổi rõ. Kiểm tra CapCut."
+                        }else{
+                            "Đã gửi thao tác kéo tới playhead. Kiểm tra vị trí clip trên timeline."
+                        }
+                    }else{
+                        "Đã gửi nút + kiểu cũ. CapCut có thể thêm clip không đúng playhead."
+                    });
                 }
                 Err(error)=>{
                     log_event(&a.log_tx,format!("IMPORT_FAILED seq={sequence} media_attempted={import_attempted} reason={error}"));
@@ -1146,6 +1160,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     a.clear_after_import=SendMessageW(a.clear_checkbox,BM_GETCHECK,0,0)!=0;
                     log_event(&a.log_tx,format!("CLEAR_AFTER_IMPORT enabled={}",a.clear_after_import));
                     if let Err(e)=save_preferences(a){log_event(&a.log_tx,format!("PREFS_WRITE_FAILED {e}"));}
+                },
+                PLAYHEAD_MODE => {
+                    let a=&mut *p;
+                    a.playhead_mode=SendMessageW(a.playhead_checkbox,BM_GETCHECK,0,0)!=0;
+                    log_event(&a.log_tx,format!("PLAYHEAD_MODE enabled={}",a.playhead_mode));
+                    text(a.status,if a.playhead_mode{
+                        "Playhead: đọc vị trí trước khi Import, kéo ảnh nếu mục tiêu an toàn."
+                    }else{
+                        "Chế độ cũ: nhấn nút +, CapCut tự quyết định vị trí."
+                    });
+                    if let Err(e)=save_preferences(a){
+                        log_event(&a.log_tx,format!("PREFS_WRITE_FAILED {e}"));
+                    }
                 },
                 PROJECT_NAME_SAVE => {
                     let a=&mut *p;
@@ -1281,7 +1308,7 @@ fn main() {
         let saved_prefs=load_preferences(&preferences);
         let project_file=logger_path().with_file_name("project_override.txt");
         let manual_project=fs::read_to_string(&project_file).unwrap_or_default();
-        log_event(&log_tx,format!("START version=0.7.9 auto_add={} block_native={} clear_after_import={}",
+        log_event(&log_tx,format!("START version=0.8.0 auto_add={} block_native={} clear_after_import={}",
             saved_prefs.auto_add,saved_prefs.block_native,saved_prefs.clear_after_import));
         let mut app = Box::new(App {
             folder,
@@ -1292,6 +1319,8 @@ fn main() {
             project_edit:null_mut(),
             block_native: saved_prefs.block_native,
             clear_after_import: saved_prefs.clear_after_import,
+            playhead_mode: saved_prefs.playhead_mode,
+            playhead_checkbox: null_mut(),
             latest: None,
             latest_sequence: None,
             image_progress: None,
@@ -1349,7 +1378,7 @@ fn main() {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             710,
-            590,
+            625,
             null_mut(),
             null_mut(),
             instance,
