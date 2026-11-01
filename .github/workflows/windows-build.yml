@@ -20,6 +20,9 @@ jobs:
     name: Test and build (Windows x64)
     runs-on: windows-latest
     timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ClipBridge-Rust
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -60,6 +63,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ClipBridge-Rust-v0.4.1-Windows-x64
-          path: ClipBridge-Rust-v0.4.1-Windows-x64.zip
+          path: ClipBridge-Rust/ClipBridge-Rust-v0.4.1-Windows-x64.zip
           if-no-files-found: error
           retention-days: 30
