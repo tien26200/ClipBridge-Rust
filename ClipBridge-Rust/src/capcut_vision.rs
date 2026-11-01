@@ -26,6 +26,20 @@ impl Shot {
         r<110 && g>120 && b>120
     }
 }
+#[cfg(test)]
+impl Shot {
+    pub(crate) fn for_test(w:usize,h:usize)->Self {
+        Self{w,h,bytes:vec![0;w*h*4]}
+    }
+    pub(crate) fn paint_for_test(&mut self,b:MediaBox,rgb:(u8,u8,u8)){
+        for y in b.top.max(0) as usize..b.bottom.max(0).min(self.h as i32) as usize{
+            for x in b.left.max(0) as usize..b.right.max(0).min(self.w as i32) as usize{
+                let p=(y*self.w+x)*4;
+                self.bytes[p..p+4].copy_from_slice(&[rgb.2,rgb.1,rgb.0,255]);
+            }
+        }
+    }
+}
 pub unsafe fn capture_media(hwnd: HWND)->Result<Shot,String> {
     let mut rect:RECT=zeroed();
     if GetWindowRect(hwnd,&mut rect)==0 {return Err("Cannot read CapCut window bounds".into());}
