@@ -302,17 +302,33 @@ pub unsafe fn import_then_add(
     open_image(editor,job.pid,&job.image,&mut trace)?;
     trace("MEDIA_IMPORT_REQUEST_FINISHED");
     let mut found=None;
-    let deadline=Instant::now()+Duration::from_millis(1800);
+    let mut candidate:Option<(MediaBox,f64)>=None;
+    let deadline=Instant::now()+Duration::from_millis(2100);
     let mut check_count=0;
     while Instant::now()<deadline {
         if !window_is_editor(editor,job.pid) {break;}
         let after=capture_media(editor)?;
         check_count+=1;
         if let Some((b,score))=find_imported_media(&before,&after) {
-            found=Some((b,score));break;
+            // After deleting an earlier Media tile, CapCut may reflow the grid
+            // while the next image thumbnail is still loading. Require two
+            // stable observations before sending an Add (+) message.
+            if let Some((prev,_))=candidate {
+                let stable=(b.left-prev.left).abs()<=8 &&
+                    (b.top-prev.top).abs()<=8 &&
+                    (b.right-prev.right).abs()<=8 &&
+                    (b.bottom-prev.bottom).abs()<=8;
+                if stable {
+                    found=Some((b,score));
+                    trace("MEDIA_TILE_STABLE confirmed=2");
+                    break;
+                }
+            }
+            candidate=Some((b,score));
+        } else {
+            candidate=None;
         }
-        // Far fewer screenshots while CapCut is rendering thumbnails.
-        thread::sleep(Duration::from_millis(140));
+        thread::sleep(Duration::from_millis(130));
     }
     trace(&format!("MEDIA_CHECKS count={check_count}"));
     let (box_,score)=found.ok_or("Imported thumbnail could not be identified safely")?;
