@@ -6,7 +6,6 @@
 //! This is NOT a public CapCut API and requires real-version testing.
 use crate::capcut_vision::{capture_media, find_imported_media, MediaBox};
 use std::{
-    ffi::OsStr,
     mem::{size_of,zeroed},
     os::windows::ffi::OsStrExt,
     path::PathBuf,
@@ -17,6 +16,7 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::*,
+    Graphics::Gdi::ScreenToClient,
     UI::{
         Accessibility::*,
         Input::KeyboardAndMouse::*,
@@ -80,7 +80,7 @@ impl Drop for HookGuard {
         unsafe {if !self.hook.is_null(){UnhookWinEvent(self.hook);}}
     }
 }
-unsafe extern "system" fn enum_dialog(hwnd:HWND,param:LPARAM)->BOOL {
+unsafe extern "system" fn enum_dialog(hwnd:HWND,param:LPARAM)->i32 {
     let state=&mut *(param as *mut DialogQuery);
     if owned_dialog(hwnd,state.pid) && IsWindowVisible(hwnd)!=0 {
         state.found=hwnd;
@@ -254,7 +254,7 @@ unsafe fn native_add_to_track(editor:HWND,b:MediaBox)->Result<(),String>{
     // WM_MOUSEMOVE, not SetCursorPos: do not change the physical cursor.
     PostMessageW(target,WM_MOUSEMOVE,0,pos);
     thread::sleep(Duration::from_millis(28));
-    if PostMessageW(target,WM_LBUTTONDOWN,MK_LBUTTON as usize,pos)==0
+    if PostMessageW(target,WM_LBUTTONDOWN,1usize,pos)==0
         || PostMessageW(target,WM_LBUTTONUP,0,pos)==0 {
         return Err("Add-to-Track native window messages rejected".into());
     }
