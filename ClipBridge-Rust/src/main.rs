@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use clipbridge::{encode, prepare_folder, save_setting, store_png, Capture, MAX_BYTES};
+mod timeline_bridge;
+use timeline_bridge::{TimelineBridge, UnsupportedCapCutAdapter, PasteResult};
 use std::{
     ffi::{OsStr, OsString},
     fs,
     fs::OpenOptions,
     io::Write,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
     mem::{size_of, zeroed},
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
@@ -31,9 +33,6 @@ const EXIT: isize = 107;
 const STATUS: isize = 108;
 const SHOW: isize = 109;
 const LOG: isize = 110;
-const AUTO_IMPORT: isize = 111;
-const IMPORT_WAIT: Duration = Duration::from_secs(45);
-const DIALOG_WAIT: Duration = Duration::from_secs(6);
 const LOG_LIMIT: u64 = 2 * 1024 * 1024;
 struct Job {
     capture: Capture,
@@ -66,9 +65,8 @@ struct App {
     worker: Option<std::thread::JoinHandle<()>>,
     log_tx: SyncSender<String>,
     log_path: PathBuf,
-    auto_import: bool,
-    queued_import: Option<(PathBuf, Instant)>,
-    dialog_import: Option<(PathBuf, Instant, u32)>,
+    timeline: TimelineBridge<UnsupportedCapCutAdapter>,
+    keyboard_hook: HHOOK,
 }
 
 // Async diagnostic logging: bounded queue, small single writer, no clipboard payload.
@@ -315,134 +313,40 @@ unsafe fn capture(app: &mut App) {
     }
 }
 
-// CapCut bridge: never mutate the clipboard, hook other processes or simulate
-// timeline paste. Only drive the standard Import dialog after CapCut is in focus.
-unsafe fn focused_capcut_pid() -> Option<u32> {
+// Ctrl+V observer is deliberately passive: it never blocks Windows paste.
+// All CapCut project operations are deferred to a future verified adapter.
+static PASTE_TARGET: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+const WM_PASTE_OBSERVED: u32 = WM_APP + 3;
+
+unsafe extern "system" fn paste_observer(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if code >= 0 && (w as u32 == WM_KEYDOWN || w as u32 == WM_SYSKEYDOWN) {
+        let k = &*(l as *const KBDLLHOOKSTRUCT);
+        if k.vkCode == b'V' as u32 && (k.flags & LLKHF_INJECTED) == 0
+            && (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0
+        {
+            let target = PASTE_TARGET.load(std::sync::atomic::Ordering::Relaxed) as HWND;
+            if !target.is_null() {
+                PostMessageW(target, WM_PASTE_OBSERVED, 0, 0);
+            }
+        }
+    }
+    CallNextHookEx(null_mut(), code, w, l)
+}
+unsafe fn focused_capcut() -> bool {
     let hwnd = GetForegroundWindow();
-    if hwnd.is_null() { return None; }
+    if hwnd.is_null() { return false; }
     let mut pid = 0u32;
     GetWindowThreadProcessId(hwnd, &mut pid);
-    if pid == 0 { return None; }
+    if pid == 0 { return false; }
     let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-    if process.is_null() { return None; }
+    if process.is_null() { return false; }
     let mut buffer = [0u16; 1024];
-    let mut length = buffer.len() as u32;
-    let success = QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) != 0;
+    let mut size = buffer.len() as u32;
+    let found = QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size) != 0;
     CloseHandle(process);
-    if !success { return None; }
-    let name = String::from_utf16_lossy(&buffer[..length as usize]).to_ascii_lowercase();
-    if name.ends_with("\\capcut.exe") { Some(pid) } else { None }
-}
-
-unsafe fn focused_dialog_for(pid: u32) -> bool {
-    let window = GetForegroundWindow();
-    if window.is_null() { return false; }
-    let mut buf = [0u16; 64];
-    let len = GetClassNameW(window, buf.as_mut_ptr(), buf.len() as i32);
-    if len <= 0 || String::from_utf16_lossy(&buf[..len as usize]) != "#32770" {
-        return false;
-    }
-    let mut window_pid = 0u32;
-    GetWindowThreadProcessId(window, &mut window_pid);
-    window_pid == pid
-}
-fn keyboard_input(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
-    INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: vk, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0,
-            },
-        },
-    }
-}
-unsafe fn send_keyboard(inputs: &[INPUT]) -> bool {
-    SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32)
-        == inputs.len() as u32
-}
-unsafe fn send_import_shortcut() -> bool {
-    // Control+I in most desktop CapCut versions.
-    send_keyboard(&[
-        keyboard_input(VK_CONTROL, 0, 0),
-        keyboard_input(b'I' as u16, 0, 0),
-        keyboard_input(b'I' as u16, 0, KEYEVENTF_KEYUP),
-        keyboard_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
-    ])
-}
-unsafe fn send_dialog_filepath(path: &Path) -> bool {
-    // Ctrl+L focuses the Windows file-dialog address field, independently of
-    // its language. Type the absolute filename using Unicode keyboard events.
-    let mut inputs = vec![
-        keyboard_input(VK_CONTROL, 0, 0),
-        keyboard_input(b'L' as u16, 0, 0),
-        keyboard_input(b'L' as u16, 0, KEYEVENTF_KEYUP),
-        keyboard_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
-        keyboard_input(VK_CONTROL, 0, 0),
-        keyboard_input(b'A' as u16, 0, 0),
-        keyboard_input(b'A' as u16, 0, KEYEVENTF_KEYUP),
-        keyboard_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
-    ];
-    for code in path.as_os_str().encode_wide() {
-        inputs.push(keyboard_input(0, code, KEYEVENTF_UNICODE));
-        inputs.push(keyboard_input(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
-    }
-    inputs.push(keyboard_input(VK_RETURN, 0, 0));
-    inputs.push(keyboard_input(VK_RETURN, 0, KEYEVENTF_KEYUP));
-    send_keyboard(&inputs)
-}
-unsafe fn schedule_import(app: &mut App, path: PathBuf) {
-    if !app.auto_import || app.paused { return; }
-    app.queued_import = Some((path, Instant::now()));
-    SetTimer(app.main, 3, 250, None);
-    log_event(&app.log_tx, "IMPORT_QUEUED waiting_for_capcut_focus");
-}
-unsafe fn advance_import(app: &mut App) {
-    if !app.auto_import || app.paused {
-        app.queued_import = None;
-        app.dialog_import = None;
-        KillTimer(app.main, 3);
-        return;
-    }
-    if let Some((_, started, pid)) = app.dialog_import.as_ref() {
-        if started.elapsed() > DIALOG_WAIT {
-            log_event(&app.log_tx, "IMPORT_DIALOG_TIMEOUT no_file_typed");
-            app.dialog_import = None;
-            KillTimer(app.main, 3);
-            return;
-        }
-        if focused_dialog_for(*pid) {
-            let (path, _, _) = app.dialog_import.take().unwrap();
-            if path.is_file() && send_dialog_filepath(&path) {
-                log_event(&app.log_tx, "IMPORT_DIALOG_PATH_SENT confirm_media_in_capcut");
-                text(app.status, "Đã gửi file vào hộp thoại Import; kiểm tra Media CapCut.");
-            } else {
-                log_event(&app.log_tx, "IMPORT_DIALOG_INPUT_FAILED");
-            }
-            KillTimer(app.main, 3);
-        }
-        return;
-    }
-    let Some((_, queued_at)) = app.queued_import.as_ref() else {
-        KillTimer(app.main, 3);
-        return;
-    };
-    if queued_at.elapsed() > IMPORT_WAIT {
-        log_event(&app.log_tx, "IMPORT_EXPIRED capcut_not_focused");
-        app.queued_import = None;
-        KillTimer(app.main, 3);
-        return;
-    }
-    if let Some(pid) = focused_capcut_pid() {
-        let (path, _) = app.queued_import.take().unwrap();
-        if !path.is_file() { KillTimer(app.main, 3); return; }
-        if send_import_shortcut() {
-            app.dialog_import = Some((path, Instant::now(), pid));
-            log_event(&app.log_tx, format!("IMPORT_SHORTCUT_SENT target_pid={pid}"));
-        } else {
-            log_event(&app.log_tx, "IMPORT_SHORTCUT_FAILED");
-            KillTimer(app.main, 3);
-        }
-    }
+    found && String::from_utf16_lossy(&buffer[..size as usize])
+        .to_ascii_lowercase().ends_with("\\capcut.exe")
 }
 
 unsafe fn choose_folder(hwnd: HWND) -> Option<PathBuf> {
@@ -750,14 +654,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 WS_TABSTOP,
             );
             control(hwnd, "BUTTON", "Mở log", LOG, 403, 280, 150, 32, WS_TABSTOP);
-            let check = control(hwnd, "BUTTON", "Tự Import khi quay lại CapCut", AUTO_IMPORT,
-                20, 320, 420, 28, BS_AUTOCHECKBOX as u32 | WS_TABSTOP);
-            SendMessageW(check, BM_SETCHECK, 1usize, 0);
             control(hwnd, "BUTTON", "Thoát", EXIT, 575, 280, 95, 32, WS_TABSTOP);
             control(
                 hwnd,
                 "STATIC",
-                "Auto Import chỉ khi CapCut đang được chọn; không tự thêm vào timeline.",
+                "Timeline adapter: chưa kích hoạt. Ctrl+V hoạt động bình thường.",
                 0,
                 20,
                 357,
@@ -781,6 +682,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             install_tray(a);
             0
         }
+        WM_PASTE_OBSERVED => {
+            let a = &mut *p;
+            if !a.paused && focused_capcut() {
+                let result = a.timeline.on_paste();
+                log_event(&a.log_tx, format!("CAPCUT_PASTE_OBSERVED result={result:?} hook_pass_through=true"));
+            }
+            0
+        }
         WM_CLIPBOARDUPDATE => {
             let a = &mut *p;
             let seq = GetClipboardSequenceNumber();
@@ -789,7 +698,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             capture(a);
             0
         }
-        WM_TIMER if w == 3 => { advance_import(&mut *p); 0 }
         WM_TIMER if w == 1 => {
             let a = &mut *p;
             if a.pending_seq != GetClipboardSequenceNumber() {
@@ -813,7 +721,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         a.latest_sequence = Some(sequence);
                         log_event(&a.log_tx, format!("SAVE_OK seq={sequence} filename={} clipboard_current_seq={} unchanged_by_app=true", path.file_name().unwrap_or_default().to_string_lossy(), GetClipboardSequenceNumber()));
                         text(a.status, &format!("Đã lưu PNG: {} (giữ clipboard ảnh gốc)", path.display()));
-                        schedule_import(a, path);
+                        a.timeline.on_image_saved(sequence, path);
                     }
                 }
                 Err(e) => { log_event(&a.log_tx, format!("SAVE_ERROR seq={sequence} error={e}")); text(a.status, &format!("Không lưu được ảnh: {e}")); },
@@ -837,12 +745,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     open_path(hwnd, &folder);
                 }
                 COPY => copy_path(&mut *p),
-                AUTO_IMPORT => {
-                    let a = &mut *p;
-                    a.auto_import = !a.auto_import;
-                    log_event(&a.log_tx, format!("AUTO_IMPORT enabled={}", a.auto_import));
-                    if !a.auto_import { a.queued_import=None; a.dialog_import=None; KillTimer(hwnd,3); }
-                },
                 LOG => { let path = (*p).log_path.clone(); open_path(hwnd, &path); },
                 PAUSE => pause(&mut *p),
                 SHOW => show(&*p),
@@ -882,10 +784,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         WM_DESTROY => {
             let a = &mut *p;
             KillTimer(hwnd, 1);
-            KillTimer(hwnd, 3);
             if a.clipboard_registered {
                 RemoveClipboardFormatListener(hwnd);
             }
+            PASTE_TARGET.store(0, std::sync::atomic::Ordering::Relaxed);
+            if !a.keyboard_hook.is_null() { UnhookWindowsHookEx(a.keyboard_hook); a.keyboard_hook = null_mut(); }
             if a.tray.uID != 0 {
                 Shell_NotifyIconW(NIM_DELETE, &a.tray);
             }
@@ -944,7 +847,7 @@ fn main() {
         let (tx, rx) = mpsc::sync_channel::<Job>(1);
         let log_path = logger_path();
         let (log_tx, log_thread) = start_logger(log_path.clone());
-        log_event(&log_tx, "START version=0.5.1 logging=metadata_only clipboard_auto_write=false");
+        log_event(&log_tx, "START version=0.6.0 timeline_adapter=unsupported clipboard_auto_write=false");
         let mut app = Box::new(App {
             folder,
             config,
@@ -971,9 +874,8 @@ fn main() {
             worker: None,
             log_tx: log_tx.clone(),
             log_path,
-            auto_import: true,
-            queued_import: None,
-            dialog_import: None,
+            timeline: TimelineBridge::new(UnsupportedCapCutAdapter),
+            keyboard_hook: null_mut(),
         });
         let class = wide("ClipBridgeRustWindow");
         let wc = WNDCLASSW {
@@ -1019,6 +921,9 @@ fn main() {
         );
         SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon_large as isize);
         window_shadow(hwnd);
+        PASTE_TARGET.store(hwnd as isize, std::sync::atomic::Ordering::Relaxed);
+        app.keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(paste_observer), instance, 0);
+        log_event(&app.log_tx, format!("PASTE_OBSERVER installed={} passive=true", !app.keyboard_hook.is_null()));
         let target = hwnd as usize;
         let worker_log = log_tx.clone();
         app.worker = Some(std::thread::spawn(move || {
