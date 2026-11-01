@@ -134,6 +134,24 @@ impl Reference {
         normalize(&mut bins,count);
         bins
     }
+    /// Only numeric location/confidence evidence is logged; never source
+    /// pixels or screenshot data. Useful when a new row changes layout.
+    pub fn diagnostic(&self,after:&Shot)->String {
+        let mut candidates:Vec<(f64,MediaBox,f64)>=media_search_slots(after)
+            .into_iter().map(|slot|{
+                (loss(&self.tile_histogram(after,slot),&self.bins),slot,0.0)
+            }).collect();
+        candidates.sort_by(|a,b|a.0.total_cmp(&b.0));
+        let Some((best,slot,_))=candidates.first().copied() else{
+            return "no-visible-media-slots".into();
+        };
+        let second=confidence_runner_up(&candidates).map(|c|c.0).unwrap_or(6.0);
+        let shift=nearest_row_shift(slot,&media_slots(after));
+        format!(
+            "best_loss={best:.2} second_loss={second:.2} x={} y={} row_shift={} unique={}",
+            slot.left,slot.top,shift,best<=1.25 && second-best>=0.36
+        )
+    }
     /// Compare each grid slot with the real source PNG, then require:
     /// - a plausible colour-histogram match;
     /// - no equally good second tile;
