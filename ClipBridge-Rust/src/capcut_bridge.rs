@@ -123,7 +123,7 @@ unsafe fn pump_messages() {
 
 #[derive(Default)]
 struct Controls {edits:Vec<HWND>,buttons:Vec<HWND>}
-unsafe extern "system" fn enum_controls(hwnd:HWND,param:LPARAM)->BOOL {
+unsafe extern "system" fn enum_controls(hwnd:HWND,param:LPARAM)->i32 {
     if IsWindowVisible(hwnd)==0 {return 1;}
     let c=&mut *(param as *mut Controls);
     let mut name=[0u16;64];
