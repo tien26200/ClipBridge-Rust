@@ -99,67 +99,121 @@ pub fn selected_media(s:&Shot)->Option<MediaBox> {
     None
 }
 
-// Use full Media grid slots rather than arbitrary sliding windows.
-// Sliding 34x28 windows returned a shifted rectangle and often clicked
-// a blank region instead of the small Add-to-Track (+) button.
-pub fn changed_media(before:&Shot,after:&Shot)->Option<(MediaBox,f64)> {
-    if before.w!=after.w || before.h!=after.h {return None;}
-    let panel_right=after.w.min(680);
+// Media cards are laid out in uniform grid cells on this CapCut/Jianying
+// profile. A selected cyan outline is not always on the freshly imported
+// item, especially AFTER the first import, so never use selection alone to
+// decide which thumbnail to add to the timeline.
+fn media_slots(s:&Shot)->Vec<MediaBox> {
+    let panel_right=s.w.min(680);
     let cols=((panel_right.saturating_sub(105))/136).clamp(2,4);
-    let mut ranked:Vec<(f64,MediaBox)>=Vec::with_capacity(16);
+    let mut slots=Vec::with_capacity(cols*4);
     for row in 0..4usize {
         for col in 0..cols {
             let x=102+col*136;
             let y=145+row*112;
-            if x+134>panel_right || y+100>after.h.min(590){continue;}
-            let mut total=0u64;
-            let mut count=0u64;
-            for yy in (y+5..y+83).step_by(4) {
-                for xx in (x+18..x+134).step_by(4) {
-                    let (r1,g1,b1)=before.pixel(xx,yy);
-                    let (r2,g2,b2)=after.pixel(xx,yy);
-                    total+=r1.abs_diff(r2) as u64+
-                        g1.abs_diff(g2) as u64+b1.abs_diff(b2) as u64;
-                    count+=3;
-                }
-            }
-            let score=total as f64/count.max(1) as f64;
-            ranked.push((score,MediaBox {
+            if x+134>panel_right || y+100>s.h.min(590){continue;}
+            slots.push(MediaBox{
                 left:(x+18) as i32,top:(y+5) as i32,
-                right:(x+134) as i32,bottom:(y+83) as i32
-            }));
+                right:(x+134) as i32,bottom:(y+83) as i32,
+            });
         }
     }
-    ranked.sort_by(|a,b|b.0.total_cmp(&a.0));
-    let (score,rect)=*ranked.first()?;
-    if score<8.0 {return None;}
-    Some((rect,score))
+    slots
+}
+fn box_score(before:&Shot,after:&Shot,b:MediaBox)->f64 {
+    let mut total=0u64;
+    let mut count=0u64;
+    for y in (b.top as usize..b.bottom as usize).step_by(4) {
+        for x in (b.left as usize..b.right as usize).step_by(4) {
+            let (r1,g1,b1)=before.pixel(x,y);
+            let (r2,g2,b2)=after.pixel(x,y);
+            total+=r1.abs_diff(r2) as u64+
+                g1.abs_diff(g2) as u64+b1.abs_diff(b2) as u64;
+            count+=3;
+        }
+    }
+    total as f64/count.max(1) as f64
+}
+fn ranked_media_changes(before:&Shot,after:&Shot)->Vec<(MediaBox,f64)> {
+    if before.w!=after.w || before.h!=after.h {return Vec::new();}
+    let mut diffs:Vec<_>=media_slots(after).into_iter()
+        .map(|b|(b,box_score(before,after,b))).collect();
+    diffs.sort_by(|a,b|b.1.total_cmp(&a.1));
+    diffs
+}
+pub fn changed_media(before:&Shot,after:&Shot)->Option<(MediaBox,f64)> {
+    ranked_media_changes(before,after).into_iter().next()
+        .filter(|(_,score)|*score>=5.0)
+}
+// Infer the offset of CapCut's selected outline compared to its enclosing
+// grid cell, and transfer that offset to a NEW cell. This keeps a known-good
+// Add (+) hotspot when CapCut keeps the OLD selected item after importing B.
+fn translate_selection_to_new_slot(
+    selected:MediaBox,
+    slots:&[MediaBox],
+    target:MediaBox,
+)->Option<MediaBox>{
+    let anchor=slots.iter()
+        .filter(|s|s.overlaps(selected))
+        .min_by_key(|s|{
+            (s.left-selected.left).abs()+
+            (s.top-selected.top).abs()+
+            (s.right-selected.right).abs()+
+            (s.bottom-selected.bottom).abs()
+        })?;
+    let deltas=[
+        selected.left-anchor.left,selected.top-anchor.top,
+        selected.right-anchor.right,selected.bottom-anchor.bottom,
+    ];
+    if deltas.iter().any(|d|d.abs()>28){return None;}
+    Some(MediaBox{
+        left:target.left+deltas[0],top:target.top+deltas[1],
+        right:target.right+deltas[2],bottom:target.bottom+deltas[3],
+    })
 }
 
+/// Only return a tile when its pixels changed significantly and the changed
+/// slot is distinct from other animated regions. If the newly selected tile
+/// matches, trust the real selected geometry. Otherwise calibrate the new
+/// slot against the old selected card, NOT against the stale card itself.
 pub fn find_imported_media(before:&Shot,after:&Shot)->Option<(MediaBox,f64)> {
-    let before_selected=selected_media(before);
-    let after_selected=selected_media(after);
-    let changed=changed_media(before,after);
-    if let (Some(selected),Some((changed_rect,score)))=(after_selected,changed) {
-        // A media deletion can cause the next import to reuse the SAME visual
-        // slot and selected outline as the deleted media. In that case
-        // before_selected == after_selected, yet the TILE CONTENT changed.
-        // The old logic incorrectly rejected it and required score>=20.
-        // A matching selection outline + a clear tile-content difference is
-        // stronger evidence than the outline moving to a different slot.
-        if changed_rect.overlaps(selected) && score>=8.0 {
-            // Restore v0.7.4's verified hit rectangle. The selection outline
-            // matches the real Add (+) hotspot more closely than the estimated
-            // grid slot when CapCut has selected the freshly imported tile.
+    let ranked=ranked_media_changes(before,after);
+    let (changed,score)=*ranked.first()?;
+    let selected_after=selected_media(after);
+    let selected_before=selected_media(before);
+    if score<5.0 {return None;}
+    // Fresh selection is strong evidence even if the appearance is subtle.
+    if let Some(selected)=selected_after {
+        if selected.overlaps(changed) {
             return Some((selected,score));
         }
     }
-    // If no selection moved and the strongest changed tile is elsewhere,
-    // use the grid rectangle only with strong visual evidence.
-    let fallback_threshold=if before_selected.is_none() && after_selected.is_none(){
-        20.0
-    } else {22.0};
-    changed.filter(|(_,score)|*score>=fallback_threshold)
+    // Unselected new tile: require change concentrated in one slot, not a
+    // general UI redraw (which might otherwise click unrelated Media).
+    let runner_up=ranked.get(1).map(|(_,score)|*score).unwrap_or(0.0);
+    if score<7.0 || score<runner_up*1.55+2.0 {
+        return None;
+    }
+    let slots=media_slots(after);
+    if let Some(selected)=selected_after.or(selected_before) {
+        if let Some(calibrated)=translate_selection_to_new_slot(selected,&slots,changed) {
+            return Some((calibrated,score));
+        }
+    }
+    // No known selected outline to calibrate against; use only aligned grid
+    // geometry when the visual evidence is unusually strong.
+    if score>=22.0 && score>=runner_up*2.0+2.0 {
+        Some((changed,score))
+    }else{None}
+}
+pub fn media_diagnostic(before:&Shot,after:&Shot)->String {
+    let diffs=ranked_media_changes(before,after);
+    let top=diffs.iter().take(3)
+        .map(|(b,s)|format!("slot=({},{}..{},{}),score={s:.1}",
+                b.left,b.top,b.right,b.bottom))
+        .collect::<Vec<_>>().join(" | ");
+    format!("before_selection={:?} after_selection={:?} top_changes=[{}]",
+        selected_media(before),selected_media(after),top)
 }
 
 #[cfg(test)]
@@ -238,7 +292,48 @@ mod tests {
         draw_outline(&mut after,first);
         let (got,score)=find_imported_media(&before,&after).unwrap();
         assert!(score>20.0,"score={score}");
+        assert_eq!(got.left,second.left);
+        assert_eq!(got.top,second.top);
+        assert_eq!(got.right,second.right);
+        assert_eq!(got.bottom,second.bottom);
+    }
+    #[test] fn second_copy_with_low_contrast_is_detected_despite_old_selection(){
+        let mut before=blank();
+        let mut after=blank();
+        let first=MediaBox{left:120,top:150,right:236,bottom:228};
+        let second=MediaBox{left:256,top:150,right:372,bottom:228};
+        draw_rect(&mut before,first,(50,70,90));
+        draw_rect(&mut after,first,(50,70,90));
+        // Brightness differs by only 10 units; prior code required >=22
+        // unless the cyan border moved to the second card.
+        draw_rect(&mut after,second,(35,35,35));
+        draw_outline(&mut before,first);
+        draw_outline(&mut after,first);
+        let (got,score)=find_imported_media(&before,&after)
+            .expect("new low-contrast slot B should not be rejected");
+        assert!(score>=7.0 && score<22.0,"score={score}");
         assert_eq!(got,second);
+    }
+    #[test] fn calibrated_selected_outline_moves_to_second_item(){
+        let slots=media_slots(&blank());
+        let original=MediaBox{left:110,top:149,right:240,bottom:231};
+        let b=MediaBox{left:256,top:150,right:372,bottom:228};
+        let predicted=translate_selection_to_new_slot(original,&slots,b).unwrap();
+        assert_eq!(predicted.left,246);
+        assert_eq!(predicted.top,149);
+        assert_eq!(predicted.right,376);
+        assert_eq!(predicted.bottom,231);
+    }
+    #[test] fn generic_ui_redraw_does_not_choose_ambiguous_tile(){
+        let mut before=blank();
+        let mut after=blank();
+        let a=MediaBox{left:120,top:150,right:236,bottom:228};
+        let b=MediaBox{left:256,top:150,right:372,bottom:228};
+        draw_rect(&mut before,a,(25,25,25));
+        draw_rect(&mut before,b,(25,25,25));
+        draw_rect(&mut after,a,(50,50,50));
+        draw_rect(&mut after,b,(50,50,50));
+        assert!(find_imported_media(&before,&after).is_none());
     }
     #[test] fn unchanged_media_is_not_clicked() {
         let s=blank(); assert!(find_imported_media(&s,&s).is_none());
