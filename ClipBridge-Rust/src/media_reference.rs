@@ -24,12 +24,6 @@ pub struct MatchingTile {
     pub runner_up_loss:f64,
     pub change_score:f64,
 }
-fn pixel_bins(rgb:(u8,u8,u8),bins:&mut [f64;BINS*3]){
-    let [r,g,b]=[rgb.0,rgb.1,rgb.2];
-    for (channel,value) in [r,g,b].iter().enumerate(){
-        bins[channel*BINS+(*value as usize/BINS.reciprocal())]=0.0;
-    }
-}
 fn add_pixel(hist:&mut [f64;BINS*3],rgb:(u8,u8,u8)){
     for (channel,value) in [rgb.0,rgb.1,rgb.2].iter().enumerate(){
         hist[channel*BINS+(*value as usize/32).min(7)]+=1.0;
@@ -160,7 +154,7 @@ mod tests {
     }
     fn png_for_test()->std::path::PathBuf{
         let path=std::env::temp_dir().join(format!("clipbridge-fingerprint-{:?}.png",
-            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()));
+            SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let file=File::create(&path).unwrap();
         let mut encoder=png::Encoder::new(file,116,78);
         encoder.set_color(png::ColorType::Rgb);
