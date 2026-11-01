@@ -57,12 +57,11 @@ jobs:
           (Get-FileHash 'dist/ClipBridge.exe' -Algorithm SHA256).Hash.ToLower() + '  ClipBridge.exe' |
             Set-Content -Path 'dist/SHA256.txt' -Encoding ascii
           Copy-Item 'VALIDATION.md' 'dist/TESTING.md'
-          Compress-Archive -Path 'dist/*' -DestinationPath 'ClipBridge-Rust-v0.5.2-Windows-x64.zip' -Force
 
       - name: Upload compiled EXE
         uses: actions/upload-artifact@v4
         with:
           name: ClipBridge-Rust-v0.5.2-Windows-x64
-          path: ClipBridge-Rust/ClipBridge-Rust-v0.5.2-Windows-x64.zip
+          path: ClipBridge-Rust/dist/*
           if-no-files-found: error
           retention-days: 30
