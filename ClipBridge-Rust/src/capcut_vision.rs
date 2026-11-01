@@ -99,54 +99,60 @@ pub fn selected_media(s:&Shot)->Option<MediaBox> {
     None
 }
 
+// Use full Media grid slots rather than arbitrary sliding windows.
+// Sliding 34x28 windows returned a shifted rectangle and often clicked
+// a blank region instead of the small Add-to-Track (+) button.
 pub fn changed_media(before:&Shot,after:&Shot)->Option<(MediaBox,f64)> {
     if before.w!=after.w || before.h!=after.h {return None;}
-    let mut best:(f64,Option<MediaBox>)=(0.0,None);
-    let x_max=after.w.saturating_sub(25);
-    let y_max=after.h.saturating_sub(20);
-    let mut y=145usize;
-    while y+86<y_max {
-        let mut x=102usize;
-        while x+116<x_max {
+    let panel_right=after.w.min(680);
+    let cols=((panel_right.saturating_sub(105))/136).clamp(2,4);
+    let mut ranked:Vec<(f64,MediaBox)>=Vec::with_capacity(16);
+    for row in 0..4usize {
+        for col in 0..cols {
+            let x=102+col*136;
+            let y=145+row*112;
+            if x+134>panel_right || y+100>after.h.min(590){continue;}
             let mut total=0u64;
             let mut count=0u64;
-            for yy in (y..y+78).step_by(4) {
-                for xx in (x..x+116).step_by(4) {
+            for yy in (y+5..y+83).step_by(4) {
+                for xx in (x+18..x+134).step_by(4) {
                     let (r1,g1,b1)=before.pixel(xx,yy);
                     let (r2,g2,b2)=after.pixel(xx,yy);
-                    total+=(r1.abs_diff(r2) as u64)
-                         +(g1.abs_diff(g2) as u64)
-                         +(b1.abs_diff(b2) as u64);
+                    total+=r1.abs_diff(r2) as u64+
+                        g1.abs_diff(g2) as u64+b1.abs_diff(b2) as u64;
                     count+=3;
                 }
             }
-            let score=total as f64 / count.max(1) as f64;
-            if score>best.0 {
-                best=(score,Some(MediaBox {
-                    left:x as i32, top:y as i32,
-                    right:(x+116) as i32,bottom:(y+78) as i32
-                }));
-            }
-            x+=34;
+            let score=total as f64/count.max(1) as f64;
+            ranked.push((score,MediaBox {
+                left:(x+18) as i32,top:(y+5) as i32,
+                right:(x+134) as i32,bottom:(y+83) as i32
+            }));
         }
-        y+=28;
     }
-    if best.0>=8.0 {best.1.map(|b|(b,best.0))} else {None}
+    ranked.sort_by(|a,b|b.0.total_cmp(&a.0));
+    let (score,rect)=*ranked.first()?;
+    if score<8.0 {return None;}
+    Some((rect,score))
 }
 
 pub fn find_imported_media(before:&Shot,after:&Shot)->Option<(MediaBox,f64)> {
     let before_selected=selected_media(before);
-    let selected=selected_media(after);
+    let after_selected=selected_media(after);
     let changed=changed_media(before,after);
-    if let Some(s)=selected {
-        if (before_selected!=Some(s) && changed.is_some_and(|(b,_)|b.overlaps(s)))
-            || (before_selected!=Some(s) && changed.is_none())
-        {
-            return Some((s,changed.map(|(_,score)|score).unwrap_or(0.0)));
+    if let Some(selected)=after_selected {
+        if before_selected!=Some(selected) {
+            // Strongest signal: a newly selected tile overlaps the changed grid
+            // slot. Avoid acting on a prior selection that stays unchanged.
+            if let Some((changed_rect,score))=changed {
+                if changed_rect.overlaps(selected) && score>=8.0 {
+                    return Some((selected,score));
+                }
+            }
         }
     }
-    // Conservative fallback: strong thumbnail change is safer than clicking
-    // the old selected tile. Never click when visual evidence is weak.
+    // Grid fallback only when enough visual evidence exists. A false positive
+    // here clicks a different tile, so prefer to fail rather than guess.
     changed.filter(|(_,score)|*score>=20.0)
 }
 
