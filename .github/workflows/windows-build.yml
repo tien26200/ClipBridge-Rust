@@ -42,11 +42,11 @@ jobs:
 
       - name: Test
         shell: pwsh
-        run: cargo test --locked
+        run: cargo test
 
       - name: Build release EXE
         shell: pwsh
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+        run: cargo build --release --target x86_64-pc-windows-msvc
 
       - name: Package EXE with SHA256
         shell: pwsh
