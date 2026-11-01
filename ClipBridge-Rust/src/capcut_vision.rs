@@ -17,7 +17,7 @@ pub struct Shot {w:usize,h:usize,bytes:Vec<u8>}
 impl Shot {
     pub fn width(&self)->usize {self.w}
     pub fn height(&self)->usize {self.h}
-    fn pixel(&self,x:usize,y:usize)->(u8,u8,u8) {
+    pub(crate) fn pixel(&self,x:usize,y:usize)->(u8,u8,u8) {
         let p=(y*self.w+x)*4;
         (self.bytes[p+2],self.bytes[p+1],self.bytes[p])
     }
@@ -103,7 +103,7 @@ pub fn selected_media(s:&Shot)->Option<MediaBox> {
 // profile. A selected cyan outline is not always on the freshly imported
 // item, especially AFTER the first import, so never use selection alone to
 // decide which thumbnail to add to the timeline.
-fn media_slots(s:&Shot)->Vec<MediaBox> {
+pub(crate) fn media_slots(s:&Shot)->Vec<MediaBox> {
     let panel_right=s.w.min(680);
     let cols=((panel_right.saturating_sub(105))/136).clamp(2,4);
     let mut slots=Vec::with_capacity(cols*4);
@@ -120,7 +120,7 @@ fn media_slots(s:&Shot)->Vec<MediaBox> {
     }
     slots
 }
-fn box_score(before:&Shot,after:&Shot,b:MediaBox)->f64 {
+pub(crate) fn box_score(before:&Shot,after:&Shot,b:MediaBox)->f64 {
     let mut total=0u64;
     let mut count=0u64;
     for y in (b.top as usize..b.bottom as usize).step_by(4) {
@@ -208,6 +208,17 @@ pub fn find_imported_media(before:&Shot,after:&Shot)->Option<(MediaBox,f64)> {
 }
 // When importing a second image, CapCut may keep highlighting A.
 // The new B thumbnail must be selected before using the (+) button.
+// Unselected targets receive the selection-outline offset inferred from a
+// visible selected card. This does not identify a source image by itself;
+// the PNG matcher in media_reference.rs supplies that evidence.
+pub(crate) fn selected_geometry_for_slot(
+    target:MediaBox,after:&Shot
+)->MediaBox {
+    let Some(selected)=selected_media(after) else {return target};
+    if selected.overlaps(target){return selected;}
+    translate_selection_to_new_slot(selected,&media_slots(after),target)
+        .unwrap_or(target)
+}
 pub fn needs_select_new_tile(target:MediaBox,current_selection:Option<MediaBox>)->bool{
     current_selection.is_some_and(|s|!s.overlaps(target))
 }
