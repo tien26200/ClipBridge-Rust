@@ -40,6 +40,7 @@ pub struct ImportReport {
 // One dedicated import worker serializes operations and owns these flags.
 static EXPECTED_PID: AtomicU32=AtomicU32::new(0);
 static EXPECTED_EDITOR: AtomicIsize=AtomicIsize::new(0);
+static CLOAKED_DIALOG: AtomicIsize=AtomicIsize::new(0);
 
 unsafe fn owned_dialog(hwnd:HWND,pid:u32)->bool {
     if hwnd.is_null() || pid==0 {return false;}
@@ -50,19 +51,24 @@ unsafe fn owned_dialog(hwnd:HWND,pid:u32)->bool {
     let n=GetClassNameW(hwnd,class.as_mut_ptr(),class.len() as i32);
     n>0 && String::from_utf16_lossy(&class[..n as usize])=="#32770"
 }
-unsafe fn cloak_dialog(dialog: HWND, editor: HWND) {
+unsafe fn cloak_dialog(dialog: HWND, _editor: HWND) {
     if IsWindow(dialog)==0 {return;}
+    // Only cloak a dialog once. v0.7.0 repeated foreground changes,
+    // EnableWindow and SetWindowPos during dialog events, creating visible
+    // focus/redraw jitter in the CapCut editor.
+    if CLOAKED_DIALOG.swap(dialog as isize,Ordering::Relaxed)==dialog as isize {
+        return;
+    }
     let ex=GetWindowLongPtrW(dialog,GWL_EXSTYLE);
     SetWindowLongPtrW(dialog,GWL_EXSTYLE,
         ex|(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW) as isize);
     SetLayeredWindowAttributes(dialog,0,0,LWA_ALPHA);
+    // Keep the picker out of the composited screen; no focus stealing or
+    // forcing the modal owner enabled while its import is in progress.
     SetWindowPos(dialog,HWND_BOTTOM,-32000,-32000,0,0,
         SWP_NOACTIVATE|SWP_NOSIZE|SWP_NOOWNERZORDER);
-    // A modal file picker disables the owning editor. Restore the editor
-    // immediately so it does not remain visually dimmed throughout import.
-    EnableWindow(editor,1);
-    if GetForegroundWindow()==dialog {SetForegroundWindow(editor);}
 }
+
 unsafe extern "system" fn on_dialog_event(
     _:HWINEVENTHOOK,_:u32,hwnd:HWND,object_id:i32,child_id:i32,_:u32,_:u32
 ) {
@@ -78,6 +84,7 @@ impl Drop for HookGuard {
     fn drop(&mut self){
         EXPECTED_PID.store(0,Ordering::Relaxed);
         EXPECTED_EDITOR.store(0,Ordering::Relaxed);
+        CLOAKED_DIALOG.store(0,Ordering::Relaxed);
         unsafe {if !self.hook.is_null(){UnhookWinEvent(self.hook);}}
     }
 }
@@ -184,7 +191,7 @@ unsafe fn wait_picker(
 }
 unsafe fn close_picker(dialog:HWND,editor:HWND) {
     if IsWindow(dialog)!=0 {PostMessageW(dialog,WM_CLOSE,0,0);}
-    EnableWindow(editor,1);
+    let _=editor;
 }
 unsafe fn open_image(
     editor:HWND,pid:u32,path:&PathBuf,
@@ -192,6 +199,7 @@ unsafe fn open_image(
 )->Result<(),String>{
     let mut msg:MSG=zeroed();
     PeekMessageW(&mut msg,null_mut(),0,0,PM_NOREMOVE);
+    CLOAKED_DIALOG.store(0,Ordering::Relaxed);
     EXPECTED_EDITOR.store(editor as isize,Ordering::Relaxed);
     EXPECTED_PID.store(pid,Ordering::Relaxed);
     let hook=SetWinEventHook(EVENT_OBJECT_SHOW,EVENT_OBJECT_SHOW,
@@ -239,27 +247,30 @@ unsafe fn packed_point(point:POINT)->isize {
     let y=point.y as u32 & 0xffff;
     ((y<<16)|x) as isize
 }
-unsafe fn native_add_to_track(editor:HWND,b:MediaBox)->Result<(),String>{
+unsafe fn native_add_to_track(editor:HWND,b:MediaBox)
+    ->Result<(i32,i32),String>{
     let rect=bounds(editor);
+    // Jiandan's verified Jianying implementation sends the WM_LBUTTON pair
+    // directly to the editor's top-level HWND. v0.7.0 used WindowFromPoint,
+    // which may target an unrelated Qt child, overlay or transparent surface.
     let screen_point=POINT {
         x:rect.left+b.right-12,
         y:rect.top+b.bottom-12,
     };
-    let hit=WindowFromPoint(screen_point);
-    let target=if !hit.is_null() && GetAncestor(hit,GA_ROOT)==editor {
-        hit
-    } else {editor};
     let mut client=screen_point;
-    if ScreenToClient(target,&mut client)==0 {return Err("ScreenToClient failed".into());}
-    let pos=packed_point(client);
-    // WM_MOUSEMOVE, not SetCursorPos: do not change the physical cursor.
-    PostMessageW(target,WM_MOUSEMOVE,0,pos);
-    thread::sleep(Duration::from_millis(28));
-    if PostMessageW(target,WM_LBUTTONDOWN,1usize,pos)==0
-        || PostMessageW(target,WM_LBUTTONUP,0,pos)==0 {
-        return Err("Add-to-Track native window messages rejected".into());
+    if ScreenToClient(editor,&mut client)==0 {
+        return Err("Cannot map Add-to-Track button into CapCut editor".into());
     }
-    Ok(())
+    let pos=packed_point(client);
+    // No WM_MOUSEMOVE: it triggers Qt hover redraws and is not part of the
+    // known working Jiandan method. The user's physical cursor stays fixed.
+    if PostMessageW(editor,WM_LBUTTONDOWN,1usize,pos)==0 {
+        return Err("Native Add-to-Track mouse-down message was rejected".into());
+    }
+    if PostMessageW(editor,WM_LBUTTONUP,0,pos)==0 {
+        return Err("Native Add-to-Track mouse-up message was rejected".into());
+    }
+    Ok((client.x,client.y))
 }
 
 /// Runs only on a dedicated worker, never inside the Windows keyboard hook.
@@ -291,15 +302,19 @@ pub unsafe fn import_then_add(
     open_image(editor,job.pid,&job.image,&mut trace)?;
     trace("MEDIA_IMPORT_REQUEST_FINISHED");
     let mut found=None;
-    let deadline=Instant::now()+Duration::from_millis(2000);
+    let deadline=Instant::now()+Duration::from_millis(1800);
+    let mut check_count=0;
     while Instant::now()<deadline {
         if !window_is_editor(editor,job.pid) {break;}
         let after=capture_media(editor)?;
+        check_count+=1;
         if let Some((b,score))=find_imported_media(&before,&after) {
             found=Some((b,score));break;
         }
-        thread::sleep(Duration::from_millis(80));
+        // Far fewer screenshots while CapCut is rendering thumbnails.
+        thread::sleep(Duration::from_millis(140));
     }
+    trace(&format!("MEDIA_CHECKS count={check_count}"));
     let (box_,score)=found.ok_or("Imported thumbnail could not be identified safely")?;
     trace(&format!("MEDIA_TILE_FOUND x={} y={} diff={score:.1}",box_.right,box_.bottom));
     if !editor_is_foreground(editor) {
@@ -308,7 +323,7 @@ pub unsafe fn import_then_add(
     if GetClipboardSequenceNumber()!=job.sequence {
         return Err("Clipboard changed during import; refusing to add a stale image".into());
     }
-    native_add_to_track(editor,box_)?;
-    trace("ADD_TO_TRACK_COMMAND_SENT_NOT_VERIFIED");
+    let (x,y)=native_add_to_track(editor,box_)?;
+    trace(&format!("ADD_TO_TRACK_SENT target=editor client_x={x} client_y={y} result_not_verified"));
     Ok(ImportReport{box_,visual_change:score,elapsed_ms:started.elapsed().as_millis()})
 }
