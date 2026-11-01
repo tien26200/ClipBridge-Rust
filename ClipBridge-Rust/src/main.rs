@@ -5,7 +5,7 @@ use std::{
     fs,
     fs::OpenOptions,
     io::Write,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     mem::{size_of, zeroed},
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
@@ -16,7 +16,7 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::{Dwm::*, Gdi::*},
     System::{Com::*, DataExchange::*, LibraryLoader::*, Memory::*, Threading::*},
-    UI::{Controls::MARGINS, Shell::*, WindowsAndMessaging::*},
+    UI::{Controls::MARGINS, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
 };
 
 const WM_SAVED: u32 = WM_APP + 1;
@@ -31,6 +31,9 @@ const EXIT: isize = 107;
 const STATUS: isize = 108;
 const SHOW: isize = 109;
 const LOG: isize = 110;
+const AUTO_IMPORT: isize = 111;
+const IMPORT_WAIT: Duration = Duration::from_secs(45);
+const DIALOG_WAIT: Duration = Duration::from_secs(6);
 const LOG_LIMIT: u64 = 2 * 1024 * 1024;
 struct Job {
     capture: Capture,
@@ -63,6 +66,9 @@ struct App {
     worker: Option<std::thread::JoinHandle<()>>,
     log_tx: SyncSender<String>,
     log_path: PathBuf,
+    auto_import: bool,
+    queued_import: Option<(PathBuf, Instant)>,
+    dialog_import: Option<(PathBuf, Instant, u32)>,
 }
 
 // Async diagnostic logging: bounded queue, small single writer, no clipboard payload.
@@ -305,6 +311,136 @@ unsafe fn capture(app: &mut App) {
                     "Chưa đọc được ảnh. Hãy copy lại khi ứng dụng nguồn phản hồi.",
                 );
             }
+        }
+    }
+}
+
+// CapCut bridge: never mutate the clipboard, hook other processes or simulate
+// timeline paste. Only drive the standard Import dialog after CapCut is in focus.
+unsafe fn focused_capcut_pid() -> Option<u32> {
+    let hwnd = GetForegroundWindow();
+    if hwnd.is_null() { return None; }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid == 0 { return None; }
+    let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+    if process.is_null() { return None; }
+    let mut buffer = [0u16; 1024];
+    let mut length = buffer.len() as u32;
+    let success = QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) != 0;
+    CloseHandle(process);
+    if !success { return None; }
+    let name = String::from_utf16_lossy(&buffer[..length as usize]).to_ascii_lowercase();
+    if name.ends_with("\\capcut.exe") { Some(pid) } else { None }
+}
+
+unsafe fn focused_dialog_for(pid: u32) -> bool {
+    let window = GetForegroundWindow();
+    if window.is_null() { return false; }
+    let mut buf = [0u16; 64];
+    let len = GetClassNameW(window, buf.as_mut_ptr(), buf.len() as i32);
+    if len <= 0 || String::from_utf16_lossy(&buf[..len as usize]) != "#32770" {
+        return false;
+    }
+    let mut window_pid = 0u32;
+    GetWindowThreadProcessId(window, &mut window_pid);
+    window_pid == pid
+}
+fn keyboard_input(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0,
+            },
+        },
+    }
+}
+unsafe fn send_keyboard(inputs: &[INPUT]) -> bool {
+    SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32)
+        == inputs.len() as u32
+}
+unsafe fn send_import_shortcut() -> bool {
+    // Control+I in most desktop CapCut versions.
+    send_keyboard(&[
+        keyboard_input(VK_CONTROL, 0, 0),
+        keyboard_input(b'I' as u16, 0, 0),
+        keyboard_input(b'I' as u16, 0, KEYEVENTF_KEYUP),
+        keyboard_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+    ])
+}
+unsafe fn send_dialog_filepath(path: &Path) -> bool {
+    // Ctrl+L focuses the Windows file-dialog address field, independently of
+    // its language. Type the absolute filename using Unicode keyboard events.
+    let mut inputs = vec![
+        keyboard_input(VK_CONTROL, 0, 0),
+        keyboard_input(b'L' as u16, 0, 0),
+        keyboard_input(b'L' as u16, 0, KEYEVENTF_KEYUP),
+        keyboard_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+        keyboard_input(VK_CONTROL, 0, 0),
+        keyboard_input(b'A' as u16, 0, 0),
+        keyboard_input(b'A' as u16, 0, KEYEVENTF_KEYUP),
+        keyboard_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+    ];
+    for code in path.as_os_str().encode_wide() {
+        inputs.push(keyboard_input(0, code, KEYEVENTF_UNICODE));
+        inputs.push(keyboard_input(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+    }
+    inputs.push(keyboard_input(VK_RETURN, 0, 0));
+    inputs.push(keyboard_input(VK_RETURN, 0, KEYEVENTF_KEYUP));
+    send_keyboard(&inputs)
+}
+unsafe fn schedule_import(app: &mut App, path: PathBuf) {
+    if !app.auto_import || app.paused { return; }
+    app.queued_import = Some((path, Instant::now()));
+    SetTimer(app.main, 3, 250, None);
+    log_event(&app.log_tx, "IMPORT_QUEUED waiting_for_capcut_focus");
+}
+unsafe fn advance_import(app: &mut App) {
+    if !app.auto_import || app.paused {
+        app.queued_import = None;
+        app.dialog_import = None;
+        KillTimer(app.main, 3);
+        return;
+    }
+    if let Some((_, started, pid)) = app.dialog_import.as_ref() {
+        if started.elapsed() > DIALOG_WAIT {
+            log_event(&app.log_tx, "IMPORT_DIALOG_TIMEOUT no_file_typed");
+            app.dialog_import = None;
+            KillTimer(app.main, 3);
+            return;
+        }
+        if focused_dialog_for(*pid) {
+            let (path, _, _) = app.dialog_import.take().unwrap();
+            if path.is_file() && send_dialog_filepath(&path) {
+                log_event(&app.log_tx, "IMPORT_DIALOG_PATH_SENT confirm_media_in_capcut");
+                text(app.status, "Đã gửi file vào hộp thoại Import; kiểm tra Media CapCut.");
+            } else {
+                log_event(&app.log_tx, "IMPORT_DIALOG_INPUT_FAILED");
+            }
+            KillTimer(app.main, 3);
+        }
+        return;
+    }
+    let Some((_, queued_at)) = app.queued_import.as_ref() else {
+        KillTimer(app.main, 3);
+        return;
+    };
+    if queued_at.elapsed() > IMPORT_WAIT {
+        log_event(&app.log_tx, "IMPORT_EXPIRED capcut_not_focused");
+        app.queued_import = None;
+        KillTimer(app.main, 3);
+        return;
+    }
+    if let Some(pid) = focused_capcut_pid() {
+        let (path, _) = app.queued_import.take().unwrap();
+        if !path.is_file() { KillTimer(app.main, 3); return; }
+        if send_import_shortcut() {
+            app.dialog_import = Some((path, Instant::now(), pid));
+            log_event(&app.log_tx, format!("IMPORT_SHORTCUT_SENT target_pid={pid}"));
+        } else {
+            log_event(&app.log_tx, "IMPORT_SHORTCUT_FAILED");
+            KillTimer(app.main, 3);
         }
     }
 }
@@ -614,16 +750,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 WS_TABSTOP,
             );
             control(hwnd, "BUTTON", "Mở log", LOG, 403, 280, 150, 32, WS_TABSTOP);
+            let check = control(hwnd, "BUTTON", "Tự Import khi quay lại CapCut", AUTO_IMPORT,
+                20, 320, 420, 28, BS_AUTOCHECKBOX as u32 | WS_TABSTOP);
+            SendMessageW(check, BM_SETCHECK, BST_CHECKED as usize, 0);
             control(hwnd, "BUTTON", "Thoát", EXIT, 575, 280, 95, 32, WS_TABSTOP);
             control(
                 hwnd,
                 "STATIC",
-                "Log: %LOCALAPPDATA%\\ClipBridge\\clipbridge.log (không lưu nội dung clipboard).",
+                "Auto Import chỉ khi CapCut đang được chọn; không tự thêm vào timeline.",
                 0,
                 20,
-                330,
+                357,
                 650,
-                30,
+                25,
                 0,
             );
             a.clipboard_registered = AddClipboardFormatListener(hwnd) != 0;
@@ -650,6 +789,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             capture(a);
             0
         }
+        WM_TIMER if w == 3 => { advance_import(&mut *p); 0 }
         WM_TIMER if w == 1 => {
             let a = &mut *p;
             if a.pending_seq != GetClipboardSequenceNumber() {
@@ -673,6 +813,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         a.latest_sequence = Some(sequence);
                         log_event(&a.log_tx, format!("SAVE_OK seq={sequence} filename={} clipboard_current_seq={} unchanged_by_app=true", path.file_name().unwrap_or_default().to_string_lossy(), GetClipboardSequenceNumber()));
                         text(a.status, &format!("Đã lưu PNG: {} (giữ clipboard ảnh gốc)", path.display()));
+                        schedule_import(a, path);
                     }
                 }
                 Err(e) => { log_event(&a.log_tx, format!("SAVE_ERROR seq={sequence} error={e}")); text(a.status, &format!("Không lưu được ảnh: {e}")); },
@@ -696,6 +837,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     open_path(hwnd, &folder);
                 }
                 COPY => copy_path(&mut *p),
+                AUTO_IMPORT => {
+                    let a = &mut *p;
+                    a.auto_import = !a.auto_import;
+                    log_event(&a.log_tx, format!("AUTO_IMPORT enabled={}", a.auto_import));
+                    if !a.auto_import { a.queued_import=None; a.dialog_import=None; KillTimer(hwnd,3); }
+                },
                 LOG => { let path = (*p).log_path.clone(); open_path(hwnd, &path); },
                 PAUSE => pause(&mut *p),
                 SHOW => show(&*p),
@@ -735,6 +882,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         WM_DESTROY => {
             let a = &mut *p;
             KillTimer(hwnd, 1);
+            KillTimer(hwnd, 3);
             if a.clipboard_registered {
                 RemoveClipboardFormatListener(hwnd);
             }
@@ -823,6 +971,9 @@ fn main() {
             worker: None,
             log_tx: log_tx.clone(),
             log_path,
+            auto_import: true,
+            queued_import: None,
+            dialog_import: None,
         });
         let class = wide("ClipBridgeRustWindow");
         let wc = WNDCLASSW {
