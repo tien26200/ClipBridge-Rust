@@ -1,32 +1,23 @@
-# ClipBridge Rust v0.4.1 — CapCut compatibility patch
+# ClipBridge Rust v0.6.0
 
-## Download a Windows EXE using GitHub Actions
+Lightweight Windows clipboard PNG auto-save utility with a **passive**, experimental CapCut timeline bridge foundation.
 
-This repository includes `.github/workflows/windows-build.yml`. On GitHub, open **Actions** → **Build ClipBridge Windows EXE** → **Run workflow**. The workflow runs Rust tests and compiles the Windows x64 release EXE on GitHub's Windows runner. Once successful, download **ClipBridge-Rust-v0.4.1-Windows-x64** from the run's **Artifacts** section; extract twice (GitHub artifact ZIP, then the bundled ZIP) to obtain `ClipBridge.exe`, `SHA256.txt`, and `TESTING.md`.
+## Current behavior
+- Watches Windows clipboard image changes (PNG, DIBV5, DIB), writes PNG asynchronously.
+- Deduplicates images by content hash and retains source clipboard on auto-save.
+- Background tray application, configurable image folder, manual copy-path button.
+- Rotating asynchronous diagnostic log: `%LOCALAPPDATA%\\ClipBridge\\clipbridge.log`.
+- Observes Ctrl+V when CapCut is foreground, without consuming the keystroke or moving mouse.
+- Adds `src/timeline_bridge.rs` interface for future CapCut-version-specific integration.
 
-An Actions run also starts on pushes to `main` or `master` that modify the source or workflow. If the repository has no `main` or `master`, choose Run workflow on its default branch or adjust the branch filter.
+## Not yet implemented
+**Ctrl+V does NOT insert external images directly into the CapCut timeline.** The built-in adapter deliberately returns `Unsupported`. User testing showed CapCut did not accept Explorer PNG clipboard paste into the timeline, although manual drag-and-drop into Media worked. No verified native timeline insertion interface is available for this CapCut version. This release does not invoke Import, modify project drafts, inject code into CapCut, or simulate mouse dragging.
 
-**Important:** The EXE is not included with this source ZIP. It is compiled by the GitHub workflow only after you upload the repository and the run succeeds. Windows + CapCut paste compatibility still requires a real manual test.
+## Windows build
+GitHub Actions: `.github/workflows/windows-build.yml`. Download the latest successful artifact `ClipBridge-Rust-v0.6.0-Windows-x64`, containing `ClipBridge.exe`, `SHA256.txt`, and `TESTING.md`. Extract once. The executable is not code-signed. Scan it with Windows Defender before running.
 
-## Behavior of the patch
+## Logs / troubleshooting
+Start ClipBridge, copy a PNG/DIB image, then check `SAVE_OK` in the log. Ctrl+V in focused CapCut should emit `CAPCUT_PASTE_OBSERVED result=Unsupported` if the hook is installed. No keys should be blocked and no windows should open automatically. Do not confuse this log event with successful timeline insertion.
 
-- Copy an image in Windows: ClipBridge automatically saves a PNG file.
-- Auto-save **does not replace the original image on the clipboard**, preserving the ability to press Ctrl+V in CapCut's timeline (depending on CapCut's version and its clipboard support).
-- **Copy đường dẫn ảnh cuối** explicitly copies the last saved file path as text when pressed; this replaces the clipboard contents, so copy the image again before using Ctrl+V to paste the image.
-- The latest saved path updates on the `WM_SAVED` event. Older worker completion events cannot replace a newer capture.
-- The application launches minimized to the Windows notification area.
-
-## Build on Windows locally
-
-Requires Rust stable MSVC and Windows SDK with `rc.exe` (Visual Studio C++ Build Tools):
-
-```powershell
-cargo test --locked
-cargo build --release --locked --target x86_64-pc-windows-msvc
-```
-
-The output will be `target\x86_64-pc-windows-msvc\release\clipbridge.exe`.
-
-## Regression tests
-
-See `VALIDATION.md` for a hands-on test checklist, including CapCut timeline paste, auto-save, manual copy-path, and rapid successive copies.
+## Next integration step
+A supported or verified CapCut timeline adapter is required for inserting PNG at the playhead without modifying the mouse or workspace layout. Verify the exact CapCut Desktop version and its accessible integration points before enabling this feature.
