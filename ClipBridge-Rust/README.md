@@ -1,8 +1,20 @@
-# ClipBridge Rust v0.7.3 — Experimental CapCut Timeline Paste
+# ClipBridge Rust v0.7.4 — Experimental CapCut Timeline Paste
 
 Copy an image in Windows; ClipBridge saves its PNG in a bounded background worker.
 When the same image remains on Windows clipboard, pressing Ctrl+V in foreground
 CapCut attempts **Import into Media → Add to Track** automatically.
+
+## v0.7.4: Media deletion regression + 3-colour icon
+
+- After a previously imported Media item is deleted, CapCut may reuse its
+  exact thumbnail slot for the next import. The vision engine now accepts
+  actual pixel changes even when the selected outline stays in the same
+  place. A two-frame stability check prevents clicks during grid reflow.
+- The native Windows title, taskbar, Alt-Tab and tray icons are embedded at
+  build time as a minimalist **circular pink/blue/yellow icon**, in nine sizes.
+  This changes the EXE icon without extra runtime dependencies.
+- Retains the three persistent Settings toggles and the conditional
+  single-paste gate from v0.7.3.
 
 ## Settings: three independent checkboxes
 
