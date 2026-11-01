@@ -1,4 +1,4 @@
-# ClipBridge Rust v0.7.0 — Experimental CapCut Timeline Paste
+# ClipBridge Rust v0.7.1 — Experimental CapCut Timeline Paste
 
 Copy an image in Windows; ClipBridge saves its PNG in a bounded background worker.
 When the same image remains on Windows clipboard, pressing Ctrl+V in foreground
@@ -6,12 +6,14 @@ CapCut attempts **Import into Media → Add to Track** automatically.
 
 ## CapCut action bridge (experimental)
 - The keyboard observer never blocks Ctrl+V and never changes clipboard.
+- Import dialog is cloaked once, without repeatedly focusing/re-enabling editor.
 - A dedicated single-job import worker waits for Ctrl+V to be released.
 - Sends Ctrl+I only in foreground CapCut/Jianying and hides the Windows File Open dialog.
 - Sends the exact saved PNG path to the native dialog.
 - Uses a bounded GDI screenshot of the Media panel before and after import.
-- Requires visual evidence of a new media tile and sends native window messages
-  to its Add (+) hotspot; the physical mouse pointer does not move.
+- Uses aligned Media grid slots and fresh selection to find the imported tile.
+- Sends the Add (+) hotspot mouse-message pair directly to the top-level
+  editor HWND (rather than an unrelated child); the physical pointer does not move.
 - Does not change window dimensions, alter project draft files or install plugins.
 - Does **not** create a native CapCut API: this is best-effort UI automation.
 
@@ -37,7 +39,7 @@ Other Ctrl+V operations pass through when no matching fresh image is on clipboar
 - PNG auto-save reuses raw PNG when possible and encodes DIB with fast compression.
 - Latest image registry avoids directory scanning and re-encoding on paste.
 - A single worker serializes imports and prevents rapid duplicate requests.
-- The GDI screenshot includes only a small region of the CapCut Media pane,
+- Media screenshot polling is reduced; screenshots include only the CapCut Media pane,
   is used in memory, and is not saved or transmitted.
 - The log uses a bounded async channel and rotates near 2 MiB.
 - The binary is unsigned; scan with Windows Defender before execution.
