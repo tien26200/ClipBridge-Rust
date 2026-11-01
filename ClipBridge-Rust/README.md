@@ -1,11 +1,17 @@
-# ClipBridge Rust v0.7.1 — Experimental CapCut Timeline Paste
+# ClipBridge Rust v0.7.2 — Experimental CapCut Timeline Paste
 
 Copy an image in Windows; ClipBridge saves its PNG in a bounded background worker.
 When the same image remains on Windows clipboard, pressing Ctrl+V in foreground
 CapCut attempts **Import into Media → Add to Track** automatically.
 
 ## CapCut action bridge (experimental)
-- The keyboard observer never blocks Ctrl+V and never changes clipboard.
+- **Fix double paste:** CapCut's native Ctrl+V was previously passed through while
+  ClipBridge imported the new image, so an old internally copied Media clip
+  appeared on the timeline before the requested image.
+- The targeted keyboard hook now **consumes only Ctrl+V** when CapCut is foreground,
+  auto-add is enabled and the clipboard sequence matches the current copied image.
+- Normal text paste, other apps and Ctrl+C/Ctrl+V within CapCut's own Media workflow
+  are passed through. Clipboard data is never replaced.
 - Import dialog is cloaked once, without repeatedly focusing/re-enabling editor.
 - A dedicated single-job import worker waits for Ctrl+V to be released.
 - Sends Ctrl+I only in foreground CapCut/Jianying and hides the Windows File Open dialog.
@@ -22,6 +28,8 @@ CapCut version, theme, scaling, Media layout or input-message behavior. The
 `IMPORT_ADD_COMMAND_SENT` event means only that the click message was posted.
 An actual timeline insertion must be confirmed on the user's CapCut desktop.
 Other Ctrl+V operations pass through when no matching fresh image is on clipboard.
+If the operation cannot be routed, ClipBridge never intentionally pastes a stale
+media item, but OS or version-dependent behavior may still require investigation.
 
 ## Test steps
 1. Exit older ClipBridge instances. Run the new EXE and keep the experimental
