@@ -41,7 +41,6 @@ struct App {
     config: PathBuf,
     latest: Option<PathBuf>,
     latest_sequence: Option<u32>,
-    publish_pending: Option<(PathBuf, u32, u8)>,
     tx: SyncSender<Job>,
     paused: bool,
     outstanding: u8,
@@ -270,49 +269,6 @@ unsafe fn apply_folder(app: &mut App) -> Result<(), String> {
         )),
     }
 }
-// Legacy v0.2 compatibility: publish ONLY CF_UNICODETEXT, exactly like
-// the original manual Copy Path button, after the save event completes.
-// Do not add CF_HDROP: some paste targets prioritize that over text.
-unsafe fn write_path_if_current(hwnd: HWND, path: &Path, expected_seq: u32) -> Result<bool, String> {
-    if GetClipboardSequenceNumber() != expected_seq {
-        return Ok(false);
-    }
-    let data = wide(path);
-    let h = GlobalAlloc(GMEM_MOVEABLE, data.len() * 2);
-    if h.is_null() {
-        return Err("Không đủ bộ nhớ clipboard.".into());
-    }
-    let p = GlobalLock(h);
-    if p.is_null() {
-        GlobalFree(h);
-        return Err("Không khóa được bộ nhớ clipboard.".into());
-    }
-    std::ptr::copy_nonoverlapping(data.as_ptr(), p as *mut u16, data.len());
-    GlobalUnlock(h);
-    if OpenClipboard(hwnd) == 0 {
-        GlobalFree(h);
-        return Err("Clipboard đang bận.".into());
-    }
-    // Recheck after opening clipboard, before clearing the source image.
-    if GetClipboardSequenceNumber() != expected_seq {
-        CloseClipboard();
-        GlobalFree(h);
-        return Ok(false);
-    }
-    if EmptyClipboard() == 0 {
-        CloseClipboard();
-        GlobalFree(h);
-        return Err("Không thể làm trống clipboard.".into());
-    }
-    if SetClipboardData(13, h).is_null() {
-        GlobalFree(h);
-        CloseClipboard();
-        return Err("Không copy được đường dẫn.".into());
-    }
-    CloseClipboard();
-    Ok(true)
-}
-
 unsafe fn write_path(hwnd: HWND, path: &Path) -> Result<(), String> {
     let data = wide(path);
     let h = GlobalAlloc(GMEM_MOVEABLE, data.len() * 2);
@@ -351,30 +307,9 @@ unsafe fn copy_path(app: &mut App) {
     match write_path(app.main, path) {
         Ok(()) => {
             app.last_seq = GetClipboardSequenceNumber();
-            text(app.status, "Đã copy đường dẫn theo cách của bản cũ.");
+            text(app.status, "Đã copy đường dẫn dạng text (clipboard ảnh gốc đã được thay).");
         }
         Err(e) => text(app.status, &e),
-    }
-}
-// Retry only while the original image clipboard sequence is still current.
-// The legacy button is still available for explicit manual path copying.
-unsafe fn publish_legacy_path(app: &mut App) {
-    let Some((path, sequence, retries)) = app.publish_pending.take() else { return; };
-    KillTimer(app.main, 2);
-    if app.paused { return; }
-    match write_path_if_current(app.main, &path, sequence) {
-        Ok(true) => {
-            app.last_seq = GetClipboardSequenceNumber();
-            text(app.status, &format!("Đã lưu và tự copy đường dẫn: {}", path.display()));
-        }
-        Ok(false) => {
-            text(app.status, &format!("Ảnh đã lưu; clipboard có nội dung mới: {}", path.display()));
-        }
-        Err(_) if retries < 10 && GetClipboardSequenceNumber() == sequence => {
-            app.publish_pending = Some((path, sequence, retries + 1));
-            SetTimer(app.main, 2, 100, None);
-        }
-        Err(e) => text(app.status, &format!("Đã lưu nhưng chưa copy đường dẫn: {e}")),
     }
 }
 fn newer_or_same_sequence(candidate: u32, previous: u32) -> bool {
@@ -396,7 +331,7 @@ unsafe fn pause(app: &mut App) {
         if app.paused {
             "Đã tạm dừng nhận ảnh."
         } else {
-            "Sẵn sàng — copy ảnh để lưu và copy file vào clipboard."
+            "Sẵn sàng — tự lưu PNG; không ghi đè clipboard."
         },
     );
     if app.paused {
@@ -499,7 +434,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             control(
                 hwnd,
                 "STATIC",
-                "ClipBridge Rust · Tự lưu ảnh và copy file cho CapCut",
+                "ClipBridge Rust · Auto-save nhẹ và giữ clipboard",
                 0,
                 20,
                 18,
@@ -566,7 +501,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             a.status = control(
                 hwnd,
                 "STATIC",
-                "Sẵn sàng — copy ảnh để tự lưu và tự copy đường dẫn.",
+                "Sẵn sàng — tự lưu PNG và giữ nguyên clipboard ảnh.",
                 STATUS,
                 20,
                 217,
@@ -600,7 +535,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             control(
                 hwnd,
                 "STATIC",
-                "Tự copy đường dẫn kiểu bản cũ sau khi lưu; nút Copy dùng khi cần thực hiện lại.",
+                "Không tự thay clipboard; Copy đường dẫn là thao tác riêng.",
                 0,
                 20,
                 330,
@@ -637,10 +572,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             capture(a);
             0
         }
-        WM_TIMER if w == 2 => {
-            publish_legacy_path(&mut *p);
-            0
-        }
         WM_SAVED => {
             let result = Box::from_raw(l as *mut Saved);
             let a = &mut *p;
@@ -649,13 +580,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             match result {
                 Ok(path) => {
                     // Do not let an older save completion replace a newer image.
-                    // More importantly, do not mutate the clipboard here: CapCut
-                    // needs the source image formats intact for Ctrl+V on timeline.
+                    // Never rewrite clipboard here. Other apps may rely on
+                    // original formats or delayed rendering owned by the source.
                     if a.latest_sequence.is_none_or(|prev| newer_or_same_sequence(sequence, prev)) {
                         a.latest = Some(path.clone());
                         a.latest_sequence = Some(sequence);
-                        a.publish_pending = Some((path.clone(), sequence, 0));
-                        publish_legacy_path(a);
+                        text(a.status, &format!("Đã lưu PNG: {} (giữ clipboard ảnh gốc)", path.display()));
                     }
                 }
                 Err(e) => text(a.status, &format!("Không lưu được ảnh: {e}")),
@@ -717,7 +647,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         WM_DESTROY => {
             let a = &mut *p;
             KillTimer(hwnd, 1);
-            KillTimer(hwnd, 2);
             if a.clipboard_registered {
                 RemoveClipboardFormatListener(hwnd);
             }
@@ -781,7 +710,6 @@ fn main() {
             config,
             latest: None,
             latest_sequence: None,
-            publish_pending: None,
             tx,
             paused: false,
             outstanding: 0,
