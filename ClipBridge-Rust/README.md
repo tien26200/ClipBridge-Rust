@@ -1,10 +1,10 @@
-# ClipBridge Rust v0.7.6 — Experimental CapCut Timeline Paste
+# ClipBridge Rust v0.7.7 — Experimental CapCut Timeline Paste
 
 Copy an image in Windows; ClipBridge saves its PNG in a bounded background worker.
 When the same image remains on Windows clipboard, pressing Ctrl+V in foreground
 CapCut attempts **Import into Media → Add to Track** automatically.
 
-## v0.7.6: Media deletion regression + 3-colour icon
+## v0.7.7: Media deletion regression + 3-colour icon
 
 - After a previously imported Media item is deleted, CapCut may reuse its
   exact thumbnail slot for the next import. The vision engine now accepts
@@ -16,7 +16,7 @@ CapCut attempts **Import into Media → Add to Track** automatically.
 - Retains the three persistent Settings toggles and the conditional
   single-paste gate from v0.7.3.
 
-## Copy-time PNG naming (v0.7.6)
+## Copy-time PNG naming (v0.7.7)
 
 When Ctrl+C copies a new image, ClipBridge immediately saves a NEW PNG file in
 the configured output folder with the name:
@@ -36,12 +36,29 @@ recent, read-only CapCut draft_meta_info.json, else `CapCutProject`.
 The explicit override field can be left blank for automatic detection.
 Neither CapCut's internal project title nor Media asset names are edited.
 
-## v0.7.6 hotfix: restore functioning Add-to-Track
+## v0.7.7 fix: second import stays in Media
+
+The visual detector now considers new changed thumbnail slots even if CapCut
+still highlights the prior Media card. It requires a unique changed cell and
+calibrates the new '+' position using the existing selection outline. If the
+old card is still selected, it performs a targeted **selection click on the
+newly imported thumbnail**, checks the new selection highlight, then sends the
+same direct Add-to-Track down/up message that worked for the first image.
+No physical pointer movement; no repeated automatic Add attempts.
+
+The app records per-slot change scores and selected-thumbnail positions in
+its log, **without saving screenshot content**. A failed selection check
+stops safely rather than adding an unrelated older picture.
+
+Other settings, three-colour icon and copy-time project-numbered PNG naming
+are unchanged.
+
+## v0.7.7 hotfix: restore functioning Add-to-Track
 
 v0.7.5 imported PNG files into Media but regressed timeline insertion.
 It introduced a synthetic `WM_MOUSEMOVE` before the '+' click,
 timed delays, and prioritized estimated grid geometry over the actual
-selected thumbnail outline. v0.7.6 **rolls back both changes** to the
+selected thumbnail outline. v0.7.7 **rolls back both changes** to the
 native v0.7.4 direct mouse-message click and selected-tile rectangle.
 The app still creates project-numbered/date-stamped PNG files at the
 moment of Ctrl+C and retains its settings and circular app icon.
@@ -49,7 +66,7 @@ moment of Ctrl+C and retains its settings and circular app icon.
 Actual timeline success requires testing in the user's CapCut app.
 No release build can verify a posted click was accepted by CapCut.
 
-## Second paste fix (v0.7.6)
+## Second paste fix (v0.7.7)
 
 CapCut may append the next imported picture in a second thumbnail slot.
 For a visibly selected new tile, the detector uses its cyan outline,
