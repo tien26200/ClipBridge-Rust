@@ -269,6 +269,82 @@ unsafe fn apply_folder(app: &mut App) -> Result<(), String> {
         )),
     }
 }
+// Publish the saved image as a Windows file-list clipboard item (CF_HDROP).
+// A text path is included for paste targets that accept Unicode text.
+// Only called when the source clipboard sequence is still current.
+unsafe fn publish_saved_file(hwnd: HWND, path: &Path, expected_seq: u32) -> Result<bool, String> {
+    if GetClipboardSequenceNumber() != expected_seq {
+        return Ok(false);
+    }
+    let mut utf16_path = wide(path);
+    utf16_path.push(0); // DROPFILES requires a double-NUL-terminated list.
+    let header_len = 20usize; // DROPFILES: DWORD, POINT, BOOL, BOOL.
+    let bytes = header_len + utf16_path.len() * 2;
+    let hdrop = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if hdrop.is_null() {
+        return Err("Không đủ bộ nhớ cho file clipboard.".into());
+    }
+    let ptr = GlobalLock(hdrop);
+    if ptr.is_null() {
+        GlobalFree(hdrop);
+        return Err("Không khóa được file clipboard.".into());
+    }
+    std::ptr::write_bytes(ptr as *mut u8, 0, bytes);
+    std::ptr::write_unaligned(ptr as *mut u32, header_len as u32);
+    std::ptr::write_unaligned((ptr as *mut u8).add(16) as *mut u32, 1); // fWide = TRUE.
+    std::ptr::copy_nonoverlapping(
+        utf16_path.as_ptr(),
+        (ptr as *mut u8).add(header_len) as *mut u16,
+        utf16_path.len(),
+    );
+    GlobalUnlock(hdrop);
+
+    let text_path = wide(path);
+    let text_handle = GlobalAlloc(GMEM_MOVEABLE, text_path.len() * 2);
+    if text_handle.is_null() {
+        GlobalFree(hdrop);
+        return Err("Không đủ bộ nhớ cho đường dẫn clipboard.".into());
+    }
+    let text_ptr = GlobalLock(text_handle);
+    if text_ptr.is_null() {
+        GlobalFree(text_handle);
+        GlobalFree(hdrop);
+        return Err("Không khóa được đường dẫn clipboard.".into());
+    }
+    std::ptr::copy_nonoverlapping(text_path.as_ptr(), text_ptr as *mut u16, text_path.len());
+    GlobalUnlock(text_handle);
+
+    if OpenClipboard(hwnd) == 0 {
+        GlobalFree(text_handle);
+        GlobalFree(hdrop);
+        return Err("Clipboard đang bận; file đã được lưu.".into());
+    }
+    if GetClipboardSequenceNumber() != expected_seq {
+        CloseClipboard();
+        GlobalFree(text_handle);
+        GlobalFree(hdrop);
+        return Ok(false);
+    }
+    if EmptyClipboard() == 0 {
+        CloseClipboard();
+        GlobalFree(text_handle);
+        GlobalFree(hdrop);
+        return Err("Không thể cập nhật clipboard.".into());
+    }
+    // Ownership of each successful handle is transferred to Windows.
+    if SetClipboardData(15, hdrop).is_null() { // CF_HDROP
+        CloseClipboard();
+        GlobalFree(text_handle);
+        GlobalFree(hdrop);
+        return Err("Không thể copy ảnh dạng file.".into());
+    }
+    if SetClipboardData(13, text_handle).is_null() { // CF_UNICODETEXT
+        GlobalFree(text_handle);
+    }
+    CloseClipboard();
+    Ok(true)
+}
+
 // Explicit user action ONLY. Automatic save never calls this function.
 unsafe fn write_path(hwnd: HWND, path: &Path) -> Result<(), String> {
     let data = wide(path);
@@ -338,7 +414,7 @@ unsafe fn pause(app: &mut App) {
         if app.paused {
             "Đã tạm dừng nhận ảnh."
         } else {
-            "Sẵn sàng — copy ảnh để tự lưu; Ctrl+V vào CapCut."
+            "Sẵn sàng — copy ảnh để lưu và copy file vào clipboard."
         },
     );
     if app.paused {
@@ -441,7 +517,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             control(
                 hwnd,
                 "STATIC",
-                "ClipBridge Rust · Tự lưu ảnh, giữ Ctrl+V cho CapCut",
+                "ClipBridge Rust · Tự lưu ảnh và copy file cho CapCut",
                 0,
                 20,
                 18,
@@ -592,7 +668,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     if a.latest_sequence.is_none_or(|prev| newer_or_same_sequence(sequence, prev)) {
                         a.latest = Some(path.clone());
                         a.latest_sequence = Some(sequence);
-                        text(a.status, &format!("Đã lưu ảnh: {} · Ctrl+V trong CapCut", path.display()));
+                        // Publish only if no newer copy has replaced this image.
+                        match publish_saved_file(a.main, &path, sequence) {
+                            Ok(true) => {
+                                a.last_seq = GetClipboardSequenceNumber();
+                                text(a.status, &format!("Đã lưu và copy file: {}", path.display()));
+                            }
+                            Ok(false) => text(a.status, &format!("Đã lưu: {} (clipboard đã đổi)", path.display())),
+                            Err(e) => text(a.status, &format!("Đã lưu: {} · {e}", path.display())),
+                        }
                     }
                 }
                 Err(e) => text(a.status, &format!("Không lưu được ảnh: {e}")),
