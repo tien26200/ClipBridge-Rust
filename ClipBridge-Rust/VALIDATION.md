@@ -1,4 +1,4 @@
-# ClipBridge Rust v0.7.0 — experimental hidden Import → Add to Track
+# ClipBridge Rust v0.7.1 — experimental hidden Import → Add to Track
 
 ## What changed
 On Ctrl+V while CapCut is foreground and the current Windows clipboard still contains
@@ -7,8 +7,10 @@ the latest auto-saved image, ClipBridge attempts to:
 2. Send CapCut's Ctrl+I shortcut after physical Ctrl+V is released.
 3. Detect and hide CapCut's native Windows file picker, fill only that PNG path.
 4. Compare the Media panel before/after import to identify a new selected thumbnail.
-5. Send a window-scoped Add-to-Track click message to the tile's + hotspot.
-6. Log each stage without writing clipboard contents or screenshots to disk.
+5. Find the newly selected tile using aligned Media grid slots.
+6. Send the Add-to-Track click message to the editor's top-level HWND.
+7. Keep the Windows cursor stationary and avoid repeated focus thrashing.
+8. Log each stage without writing clipboard contents or screenshots to disk.
 
 The pointer stays in place; application windows are not resized.
 This is an experimental UI-message automation, not a native CapCut API.
@@ -17,7 +19,7 @@ The CapCut International layout and hidden importer still need real-machine test
 Do NOT assume a successful build proves the timeline insert worked.
 
 ## Test
-1. Close every old ClipBridge instance and run v0.7.0.
+1. Close every old ClipBridge instance and run v0.7.1.
 2. Use a disposable CapCut project with Media panel visible and normal window size.
 3. Ensure Ctrl+I manually opens Windows File Open dialog; if not, uncheck Auto Add.
 4. Copy a fresh picture from Chrome; do not click Copy Path.
@@ -33,6 +35,8 @@ Do NOT assume a successful build proves the timeline insert worked.
 - Fail closed on no image, wrong foreground process, unrecognized import dialog,
   uncertain thumbnail, busy queue or focus changes.
 - `IMPORT_ADD_COMMAND_SENT` confirms only message dispatch, **not** verified insertion.
+- v0.7.0 did import into Media but failed to add to timeline for the tester;
+  v0.7.1 changes HWND targeting and tile geometry; it still requires a real test.
 - Turn off the experimental checkbox if the CapCut version differs.
 - Antivirus scan recommended; executable is unsigned.
 
