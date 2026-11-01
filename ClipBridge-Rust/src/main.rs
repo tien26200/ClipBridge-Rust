@@ -752,7 +752,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             control(hwnd, "BUTTON", "Mở log", LOG, 403, 280, 150, 32, WS_TABSTOP);
             let check = control(hwnd, "BUTTON", "Tự Import khi quay lại CapCut", AUTO_IMPORT,
                 20, 320, 420, 28, BS_AUTOCHECKBOX as u32 | WS_TABSTOP);
-            SendMessageW(check, BM_SETCHECK, BST_CHECKED as usize, 0);
+            SendMessageW(check, BM_SETCHECK, 1usize, 0);
             control(hwnd, "BUTTON", "Thoát", EXIT, 575, 280, 95, 32, WS_TABSTOP);
             control(
                 hwnd,
