@@ -1,18 +1,25 @@
-# ClipBridge v0.5.2 — Experimental CapCut Auto Import
+# ClipBridge Rust v0.6.0 — Passive timeline bridge foundation
 
-## Workflow
-- Copy an image as before. ClipBridge saves the PNG on its worker.
-- When CapCut is brought to the foreground within 45 seconds, ClipBridge sends Ctrl+I to open the Import picker.
-- Only if a Windows common File Open dialog (#32770) appears in the CapCut process within 6 seconds, ClipBridge uses Ctrl+L and Unicode keyboard input to enter the saved PNG path and confirm.
-- No clipboard changes. No automatic insertion into timeline.
-- Toggle Auto Import in the ClipBridge settings if the version of CapCut uses a different dialog or keyboard shortcut.
+## Current functionality
+- Automatically captures Windows PNG/DIB images and saves PNG in a bounded background worker.
+- Retains source clipboard formats after automatic save.
+- Maintains the last saved image in a Rust TimelineBridge module.
+- Observes Ctrl+V using a non-blocking, pass-through Windows low-level keyboard hook.
+- Checks whether CapCut is the foreground executable before logging the paste event.
+- Does not click, drag, move the mouse, show Import, change the timeline or edit project files.
+- CapCut adapter intentionally returns Unsupported until a version-specific integration is independently tested.
+- Log: `%LOCALAPPDATA%\\ClipBridge\\clipbridge.log`.
 
-## Test
-1. Close every previous ClipBridge instance.
-2. Open CapCut's project; verify Ctrl+I manually opens the Windows file chooser. If it does not, turn Auto Import off.
-3. Copy one image in browser. Switch back to CapCut within 45 seconds.
-4. Check whether the saved image appears in Media. If not, use Import or drag and drop normally.
-5. Open `%LOCALAPPDATA%\\ClipBridge\\clipbridge.log` and inspect IMPORT_* entries.
+## Why no timeline insertion yet?
+Observed: CapCut doesn't accept Explorer PNG Ctrl+V into timeline, but does accept file drag-and-drop into Media.
+Windows alone cannot force another application to insert external media into its internal timeline by writing clipboard image/file formats.
+An actual adapter must use a supported integration or tested CapCut UI automation with no mouse/viewport changes.
+Do not claim Timeline Insert is supported until verified on the target version.
 
-## Notes
-The import path is sent only after a foreground CapCut process and an associated Windows #32770 dialog are detected. This feature is experimental and CapCut versions can vary. A log message IMPORT_DIALOG_PATH_SENT means input was sent, not that import succeeded. Input simulation may be blocked by elevated-process security. The app neither injects into CapCut nor writes to its project database.
+## Regression checklist
+1. Exit previous instances, start v0.6.0 and copy an image.
+2. Verify PNG save, image clipboard stays intact, tray and log function.
+3. Switch to CapCut, press Ctrl+V; no Import or mouse automation should occur.
+4. See `CAPCUT_PASTE_OBSERVED result=Unsupported` in log (if keyboard hook was installed).
+5. Copy again rapidly; verify latest image and the original clipboard still remain usable.
+6. Verify no virtual-key interception or drop-down injection occurs.
