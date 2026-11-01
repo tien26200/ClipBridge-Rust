@@ -613,11 +613,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 32,
                 WS_TABSTOP,
             );
+            control(hwnd, "BUTTON", "Mở log", LOG, 403, 280, 150, 32, WS_TABSTOP);
             control(hwnd, "BUTTON", "Thoát", EXIT, 575, 280, 95, 32, WS_TABSTOP);
             control(
                 hwnd,
                 "STATIC",
-                "Không tự thay clipboard; Copy đường dẫn là thao tác riêng.",
+                "Log: %LOCALAPPDATA%\\ClipBridge\\clipbridge.log (không lưu nội dung clipboard).",
                 0,
                 20,
                 330,
