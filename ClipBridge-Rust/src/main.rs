@@ -3,6 +3,7 @@ use clipbridge::{encode, prepare_folder, save_setting, store_png_named, Capture,
 mod timeline_bridge;
 mod capcut_bridge;
 mod capcut_vision;
+mod media_reference;
 mod project_name;
 use timeline_bridge::{TimelineBridge, UnsupportedCapCutAdapter};
 use capcut_bridge::ImportJob;
@@ -57,6 +58,35 @@ struct Saved {
 struct ImportComplete {
     result: Result<capcut_bridge::ImportReport, String>,
     sequence: u32,
+    import_attempted: bool,
+}
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+struct ImageProgress {
+    seq:u32,
+    import_attempted:bool,
+    add_sent:bool,
+}
+impl ImageProgress {
+    fn new(seq:u32)->Self {
+        Self{seq,import_attempted:false,add_sent:false}
+    }
+    fn reuse_media(self)->bool{self.import_attempted && !self.add_sent}
+    fn mark_import(&mut self){self.import_attempted=true;}
+    fn mark_add(&mut self){self.import_attempted=true;self.add_sent=true;}
+}
+#[cfg(test)]
+mod image_progress_tests {
+    use super::ImageProgress;
+    #[test] fn first_try_imports_but_retry_uses_existing_media(){
+        let mut b=ImageProgress::new(579);
+        assert!(!b.reuse_media());
+        b.mark_import();
+        assert!(b.reuse_media());
+        b.mark_add();
+        assert!(!b.reuse_media());
+        assert!(b.add_sent);
+        assert!(!ImageProgress::new(588).reuse_media());
+    }
 }
 struct App {
     folder: PathBuf,
@@ -69,6 +99,7 @@ struct App {
     clear_after_import: bool,
     latest: Option<PathBuf>,
     latest_sequence: Option<u32>,
+    image_progress: Option<ImageProgress>,
     tx: SyncSender<Job>,
     paused: bool,
     outstanding: u8,
@@ -521,22 +552,37 @@ unsafe fn enqueue_import(a:&mut App,editor:usize,pid:u32,sequence:u32,path:PathB
     if a.paused || !a.import_enabled{return;}
     if a.import_busy {
         log_event(&a.log_tx,"IMPORT_SKIPPED reason=busy");
+        text(a.status,"Đang xử lý ảnh trước; thử lại khi hoàn tất.");
         return;
     }
     if a.last_import_attempt.is_some_and(|t|t.elapsed().as_millis()<400) {
         log_event(&a.log_tx,"IMPORT_SKIPPED reason=cooldown");
+        text(a.status,"Đang ổn định trạng thái Media; đừng dán quá nhanh.");
         return;
     }
+    let progress=a.image_progress.filter(|p|p.seq==sequence);
+    if progress.is_some_and(|p|p.add_sent) {
+        // Posting a click is NOT proof of insertion. Do not post it twice:
+        // if the first succeeded, another click could create a duplicate.
+        log_event(&a.log_tx,format!("IMPORT_ALREADY_ADD_SENT seq={sequence} no_duplicate=true"));
+        text(a.status,"Đã gửi nút + cho ảnh này. Nếu vẫn chưa thấy clip, hãy Ctrl+C lại ảnh để thử.");
+        return;
+    }
+    let reuse_media=progress.is_some_and(|p|p.reuse_media());
     if GetClipboardSequenceNumber()!=sequence || !path.is_file() {
         log_event(&a.log_tx,"IMPORT_SKIPPED reason=clipboard_changed_or_file_missing");
         return;
     }
-    match a.import_tx.try_send(ImportJob {editor,pid,image:path,sequence}) {
+    match a.import_tx.try_send(ImportJob {editor,pid,image:path,sequence,reuse_media}) {
         Ok(()) => {
             a.import_busy=true;
             a.last_import_attempt=Some(Instant::now());
-            log_event(&a.log_tx,format!("IMPORT_QUEUED seq={sequence} pid={pid}"));
-            text(a.status,"Đang đưa ảnh vào CapCut Media rồi thêm vào timeline…");
+            log_event(&a.log_tx,format!("IMPORT_QUEUED seq={sequence} pid={pid} reuse_media={reuse_media}"));
+            text(a.status,if reuse_media {
+                "Đang tìm ảnh đã Import trong Media; không Import trùng…"
+            }else {
+                "Đang đưa ảnh vào CapCut Media rồi thêm vào timeline…"
+            });
         }
         Err(mpsc::TrySendError::Full(_))=>{
             log_event(&a.log_tx,"IMPORT_QUEUE_FULL");
@@ -562,6 +608,7 @@ unsafe fn clear_clipboard_if_unchanged(a:&mut App,seq:u32)->Result<bool,String>{
     } else {
         a.last_seq=GetClipboardSequenceNumber();
         a.latest_sequence=None;
+        a.image_progress=None;
         a.pending_import=None;
         a.latest=None; // clears only in-memory latest; PNG files remain.
         PASTE_IMAGE_SEQ.store(0,Ordering::Relaxed);
@@ -649,6 +696,7 @@ unsafe fn copy_path(app: &mut App) {
         Ok(()) => {
             app.last_seq = GetClipboardSequenceNumber();
             PASTE_IMAGE_SEQ.store(0,Ordering::Relaxed);
+            app.image_progress=None;
             log_event(&app.log_tx, "MANUAL_COPY_PATH success clipboard_replaced=true");
             text(app.status, "Đã copy đường dẫn dạng text (clipboard ảnh gốc đã được thay).");
         }
@@ -949,7 +997,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             let complete=Box::from_raw(l as *mut ImportComplete);
             let a=&mut *p;
             a.import_busy=false;
-            let ImportComplete {result,sequence}=*complete;
+            let ImportComplete {result,sequence,import_attempted}=*complete;
+            if let Some(progress)=a.image_progress.as_mut().filter(|p|p.seq==sequence){
+                if import_attempted {progress.mark_import();}
+                if result.is_ok(){progress.mark_add();}
+                log_event(&a.log_tx,format!(
+                    "IMAGE_STATE seq={sequence} media_import_attempted={} add_sent={}",
+                    progress.import_attempted,progress.add_sent));
+            }
             match result {
                 Ok(info)=>{
                     log_event(&a.log_tx,format!(
@@ -964,11 +1019,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                             Err(e)=>log_event(&a.log_tx,format!("CLIPBOARD_CLEAR_FAILED seq={sequence} {e}")),
                         }
                     }
-                    text(a.status,"Đã gửi nút + của Media tới CapCut. Kiểm tra timeline; nếu chưa chèn, gửi log.");
+                    text(a.status,"Đã gửi lệnh + cho đúng ảnh Media. Chưa xác minh clip trên timeline; kiểm tra CapCut.");
                 }
                 Err(error)=>{
-                    log_event(&a.log_tx,format!("IMPORT_FAILED seq={sequence} reason={error}"));
-                    text(a.status,&format!("Chưa chèn được ảnh: {error}. Xem log."));
+                    log_event(&a.log_tx,format!("IMPORT_FAILED seq={sequence} media_attempted={import_attempted} reason={error}"));
+                    text(a.status,if import_attempted {
+                        "Đã gửi Import nhưng chưa Add. Ctrl+V lại sẽ tìm ảnh đã Import, không Import trùng."
+                    } else {
+                        "Import chưa hoàn tất. Kiểm tra log rồi copy/dán lại."
+                    });
                 }
             }
             0
@@ -1019,6 +1078,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     if a.latest_sequence.is_none_or(|prev| newer_or_same_sequence(sequence, prev)) {
                         a.latest = Some(path.clone());
                         a.latest_sequence = Some(sequence);
+                        if a.image_progress.is_none_or(|p|p.seq!=sequence){
+                            a.image_progress=Some(ImageProgress::new(sequence));
+                            log_event(&a.log_tx,format!("IMAGE_TRACK_CREATED seq={sequence}"));
+                        }
                         if GetClipboardSequenceNumber()==sequence {
                             PASTE_IMAGE_SEQ.store(sequence,Ordering::Relaxed);
                         }
@@ -1231,6 +1294,7 @@ fn main() {
             clear_after_import: saved_prefs.clear_after_import,
             latest: None,
             latest_sequence: None,
+            image_progress: None,
             tx,
             paused: false,
             outstanding: 0,
@@ -1319,11 +1383,16 @@ fn main() {
         app.import_worker=Some(std::thread::spawn(move || {
             for job in import_rx {
                 let seq=job.sequence;
-                log_event(&import_log,format!("IMPORT_STARTED seq={seq}"));
+                let mut import_attempted=job.reuse_media;
+                log_event(&import_log,format!("IMPORT_STARTED seq={seq} reuse_media={}",job.reuse_media));
                 let result=capcut_bridge::import_then_add(&job, |step| {
+                    if step=="FILE_DIALOG_PATH_SENT" ||
+                        step=="MEDIA_IMPORT_REQUEST_FINISHED" {
+                        import_attempted=true;
+                    }
                     log_event(&import_log,format!("IMPORT_STEP seq={seq} {step}"));
                 });
-                let raw=Box::into_raw(Box::new(ImportComplete {result,sequence:seq}));
+                let raw=Box::into_raw(Box::new(ImportComplete {result,sequence:seq,import_attempted}));
                 if PostMessageW(target as HWND,WM_IMPORT_FINISHED,0,raw as isize)==0{
                     drop(Box::from_raw(raw));
                 }
