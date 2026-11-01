@@ -7,7 +7,7 @@
 //! No screenshot pixels, user images, or RGB histograms are written to disk.
 //! Verification is approximate: it fails closed if thumbnails are ambiguous.
 use crate::capcut_vision::{
-    box_score,media_slots,selected_geometry_for_slot,MediaBox,Shot,
+    box_score,media_slots,media_search_slots,selected_geometry_for_slot,MediaBox,Shot,
 };
 use std::{fs::File,io::BufReader,path::Path};
 
@@ -24,6 +24,7 @@ pub struct MatchingTile {
     pub loss:f64,
     pub runner_up_loss:f64,
     pub change_score:f64,
+    pub row_shift:i32,
 }
 fn add_pixel(hist:&mut [f64;BINS*3],rgb:(u8,u8,u8)){
     for (channel,value) in [rgb.0,rgb.1,rgb.2].iter().enumerate(){
@@ -36,6 +37,29 @@ fn normalize(hist:&mut [f64;BINS*3],samples:usize){
 }
 fn loss(a:&[f64;BINS*3],b:&[f64;BINS*3])->f64{
     a.iter().zip(b.iter()).map(|(a,b)|(a-b).abs()).sum()
+}
+// Scan offsets of one physical thumbnail are highly correlated. Without
+// non-maximum suppression, a source match at y=234 and y=248 is treated as
+// two competing Media files and incorrectly rejected due low margin.
+fn same_card(a:MediaBox,b:MediaBox)->bool {
+    let ax=(a.left+a.right)/2;
+    let bx=(b.left+b.right)/2;
+    let ay=(a.top+a.bottom)/2;
+    let by=(b.top+b.bottom)/2;
+    (ax-bx).abs()<=65 && (ay-by).abs()<=75
+}
+fn confidence_runner_up(
+    candidates:&[(f64,MediaBox,f64)]
+)->Option<(f64,MediaBox,f64)>{
+    let (_,best,_) = *candidates.first()?;
+    candidates.iter().copied().find(|(_,b,_)|!same_card(*b,best))
+}
+fn nearest_row_shift(slot:MediaBox,anchors:&[MediaBox])->i32{
+    anchors.iter()
+        .filter(|b|(b.left-slot.left).abs()<=8)
+        .map(|b|slot.top-b.top)
+        .min_by_key(|d|d.abs())
+        .unwrap_or(0)
 }
 impl Reference {
     pub fn from_png(path:&Path)->Result<Self,String>{
@@ -115,8 +139,8 @@ impl Reference {
     /// - no equally good second tile;
     /// - a visible change OR source-consistent selected-card evidence.
     pub fn locate(&self,before:Option<&Shot>,after:&Shot)->Option<MatchingTile>{
-        let slots=media_slots(after);
-        let mut candidates:Vec<(f64,MediaBox,f64)>=slots.into_iter()
+        let anchors=media_slots(after);
+        let mut candidates:Vec<(f64,MediaBox,f64)>=media_search_slots(after).into_iter()
             .map(|box_|{
                 let hist=self.tile_histogram(after,box_);
                 let l=loss(&hist,&self.bins);
@@ -125,7 +149,10 @@ impl Reference {
             }).collect();
         candidates.sort_by(|a,b|a.0.total_cmp(&b.0));
         let (best,slot,changed)=*candidates.first()?;
-        let second=candidates.get(1).map(|c|c.0).unwrap_or(6.0);
+        // Compare against another PHYSICAL card, not neighboring scan
+        // offsets of the same thumbnail. This is crucial when CapCut
+        // auto-scrolls to the first item of the next row.
+        let second=confidence_runner_up(&candidates).map(|c|c.0).unwrap_or(6.0);
         // 0 means an exact visual match, 6 the maximum colour disagreement.
         // Similar-looking media should fail rather than click the wrong card.
         if best>1.25 || second-best<0.36 {return None;}
@@ -134,12 +161,14 @@ impl Reference {
         // then come from the source's distinct visual match, not UI motion.
         if before.is_some() && changed<3.5 {return None;}
         let chosen=selected_geometry_for_slot(slot,after);
+        let row_shift=nearest_row_shift(slot,&anchors);
         Some(MatchingTile{
             rect:chosen,
             slot,
             loss:best,
             runner_up_loss:second,
             change_score:changed,
+            row_shift,
         })
     }
 }
@@ -186,6 +215,58 @@ mod tests {
         assert_eq!(found.slot,slot);
         assert!(found.loss<0.1,"source image should match target thumbnail");
         fs::remove_file(path).unwrap();
+    }
+    #[test] fn first_thumbnail_of_new_row_after_scroll_matches_source(){
+        let png=png_for_test();
+        let reference=Reference::from_png(&png).unwrap();
+        let mut before=Shot::for_test(700,590);
+        let mut after=Shot::for_test(700,590);
+        let colour_old=(220,55,55);
+        // Three old first-column cards visibly move when Media reflows.
+        let old_rows=[
+            MediaBox{left:120,top:150,right:236,bottom:228},
+            MediaBox{left:120,top:262,right:236,bottom:340},
+            MediaBox{left:120,top:374,right:236,bottom:452},
+        ];
+        for old in old_rows {before.paint_for_test(old,colour_old);}
+        let shifted_old=[
+            MediaBox{left:120,top:178,right:236,bottom:256},
+            MediaBox{left:120,top:290,right:236,bottom:368},
+        ];
+        for old in shifted_old {after.paint_for_test(old,colour_old);}
+        // Newly imported B is first thumbnail in the third displayed row,
+        // with a y=+28 reflow relative to the old fixed grid.
+        let new_b=MediaBox{left:120,top:402,right:236,bottom:480};
+        after.paint_for_test(new_b,(20,70,220));
+        let matched=reference.locate(Some(&before),&after)
+            .expect("should identify B despite changes across first-column rows");
+        assert!(matched.slot.overlaps(new_b));
+        assert!((matched.slot.top-new_b.top).abs()<=14,
+            "dynamic scan should find actual shifted row");
+        assert!((matched.slot.left-new_b.left).abs()<=1);
+        assert!(matched.change_score>=3.5);
+        fs::remove_file(png).unwrap();
+    }
+    #[test] fn adjacent_scroll_offsets_are_same_physical_card(){
+        let a=MediaBox{left:120,top:290,right:236,bottom:368};
+        let b=MediaBox{left:120,top:304,right:236,bottom:382};
+        let c=MediaBox{left:256,top:290,right:372,bottom:368};
+        assert!(same_card(a,b));
+        assert!(!same_card(a,c));
+        let scored=[(0.1,a,50.0),(0.11,b,40.0),(2.0,c,10.0)];
+        assert_eq!(confidence_runner_up(&scored).unwrap().0,2.0);
+    }
+    #[test] fn first_tile_fourth_row_with_negative_scroll_offset(){
+        let png=png_for_test();
+        let reference=Reference::from_png(&png).unwrap();
+        let before=Shot::for_test(700,590);
+        let mut after=Shot::for_test(700,590);
+        let new_b=MediaBox{left:120,top:458,right:236,bottom:536};
+        after.paint_for_test(new_b,(20,70,220));
+        let found=reference.locate(Some(&before),&after)
+            .expect("fourth row first column must be in visible search");
+        assert!((found.slot.top-458).abs()<=14);
+        fs::remove_file(png).unwrap();
     }
     #[test] fn unchanged_screen_does_not_claim_new_import(){
         let path=png_for_test();
