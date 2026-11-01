@@ -1,0 +1,188 @@
+//! Verify a CapCut thumbnail against the exact PNG that ClipBridge imported.
+//! The v0.7.7 "second image" bug arises when old selection outlines stay
+//! unchanged, and the full Media panel repaints. A whole-panel diff cannot
+//! distinguish the new PNG from an older Media item. Use a low-memory colour
+//! histogram of the actual source file, plus a slot-change guard.
+//!
+//! No screenshot pixels, user images, or RGB histograms are written to disk.
+//! Verification is approximate: it fails closed if thumbnails are ambiguous.
+use crate::capcut_vision::{
+    box_score,media_slots,selected_geometry_for_slot,MediaBox,Shot,
+};
+use std::{fs::File,io::BufReader,path::Path};
+
+const BINS:usize=8;
+#[derive(Debug)]
+pub struct Reference {
+    aspect:f64,
+    bins:[f64;BINS*3],
+}
+#[derive(Clone,Copy,Debug)]
+pub struct MatchingTile {
+    pub rect:MediaBox,
+    pub loss:f64,
+    pub runner_up_loss:f64,
+    pub change_score:f64,
+}
+fn pixel_bins(rgb:(u8,u8,u8),bins:&mut [f64;BINS*3]){
+    let [r,g,b]=[rgb.0,rgb.1,rgb.2];
+    for (channel,value) in [r,g,b].iter().enumerate(){
+        bins[channel*BINS+(*value as usize/BINS.reciprocal())]=0.0;
+    }
+}
+fn add_pixel(hist:&mut [f64;BINS*3],rgb:(u8,u8,u8)){
+    for (channel,value) in [rgb.0,rgb.1,rgb.2].iter().enumerate(){
+        hist[channel*BINS+(*value as usize/32).min(7)]+=1.0;
+    }
+}
+fn normalize(hist:&mut [f64;BINS*3],samples:usize){
+    if samples==0{return;}
+    for b in hist { *b/=samples as f64; }
+}
+fn loss(a:&[f64;BINS*3],b:&[f64;BINS*3])->f64{
+    a.iter().zip(b.iter()).map(|(a,b)|(a-b).abs()).sum()
+}
+impl Reference {
+    pub fn from_png(path:&Path)->Result<Self,String>{
+        let file=File::open(path).map_err(|e|e.to_string())?;
+        let mut decoder=png::Decoder::new(BufReader::new(file));
+        decoder.set_transformations(png::Transformations::EXPAND|png::Transformations::STRIP_16);
+        let mut reader=decoder.read_info().map_err(|e|e.to_string())?;
+        let (w,h)=(reader.info().width as usize,reader.info().height as usize);
+        if w==0||h==0||w.saturating_mul(h)>90_000_000 {
+            return Err("PNG dimensions outside matcher limits".into());
+        }
+        let (colour,depth)=reader.output_color_type();
+        if depth!=png::BitDepth::Eight {
+            return Err("PNG source matcher only supports decoded 8-bit colour".into());
+        }
+        let channels=match colour {
+            png::ColorType::Rgb=>3,
+            png::ColorType::Rgba=>4,
+            png::ColorType::Grayscale=>1,
+            png::ColorType::GrayscaleAlpha=>2,
+            _=>return Err("Unsupported source PNG colour type".into()),
+        };
+        let x_step=(w/42).max(1);
+        let y_step=(h/30).max(1);
+        let mut bins=[0f64;BINS*3];
+        let mut samples=0usize;
+        for y in 0..h {
+            let row=reader.next_row().map_err(|e|e.to_string())?
+                .ok_or("PNG decoder returned fewer rows than expected")?;
+            if y%y_step!=y_step/2 {continue;}
+            let data=row.data();
+            for x in (x_step/2..w).step_by(x_step) {
+                let p=x*channels;
+                if p+channels>data.len(){continue;}
+                let (r,g,b,a)=match channels {
+                    4=>(data[p],data[p+1],data[p+2],data[p+3]),
+                    3=>(data[p],data[p+1],data[p+2],255),
+                    2=>(data[p],data[p],data[p],data[p+1]),
+                    _=>(data[p],data[p],data[p],255)
+                };
+                let composite=|c:u8|(((c as u16*a as u16)+
+                    29*(255-a as u16))/255) as u8;
+                add_pixel(&mut bins,(composite(r),composite(g),composite(b)));
+                samples+=1;
+            }
+        }
+        if samples<24 {return Err("PNG too small for source fingerprint".into());}
+        normalize(&mut bins,samples);
+        Ok(Self{aspect:w as f64/h as f64,bins})
+    }
+    fn tile_histogram(&self,s:&Shot,b:MediaBox)->[f64;BINS*3] {
+        let mut bins=[0.0;BINS*3];
+        let width=(b.right-b.left).max(1) as f64;
+        let height=(b.bottom-b.top).max(1) as f64;
+        let ratio=self.aspect.clamp(0.03,30.0);
+        let (image_w,image_h)=if width/height>ratio {
+            (height*ratio,height)
+        }else{(width,width/ratio)};
+        let x0=b.left as f64+(width-image_w)/2.0;
+        let y0=b.top as f64+(height-image_h)/2.0;
+        let mut count=0usize;
+        // Reject border pixels and filename text overlays at the bottom.
+        for j in 1..15usize{
+            for i in 1..21usize{
+                let x=(x0+image_w*(i as f64/21.0)).round() as i32;
+                let y=(y0+image_h*(j as f64/16.0)).round() as i32;
+                if x<0||y<0||x>=s.width() as i32||y>=s.height() as i32{continue;}
+                add_pixel(&mut bins,s.pixel(x as usize,y as usize));
+                count+=1;
+            }
+        }
+        normalize(&mut bins,count);
+        bins
+    }
+    /// Compare each grid slot with the real source PNG, then require:
+    /// - a plausible colour-histogram match;
+    /// - no equally good second tile;
+    /// - a visible change OR source-consistent selected-card evidence.
+    pub fn locate(&self,before:&Shot,after:&Shot)->Option<MatchingTile>{
+        let slots=media_slots(after);
+        let mut candidates:Vec<(f64,MediaBox,f64)>=slots.into_iter()
+            .map(|box_|{
+                let hist=self.tile_histogram(after,box_);
+                let l=loss(&hist,&self.bins);
+                let change=box_score(before,after,box_);
+                (l,box_,change)
+            }).collect();
+        candidates.sort_by(|a,b|a.0.total_cmp(&b.0));
+        let (best,slot,changed)=*candidates.first()?;
+        let second=candidates.get(1).map(|c|c.0).unwrap_or(6.0);
+        // 0 means an exact visual match, 6 the maximum colour disagreement.
+        // Similar-looking media should fail rather than click the wrong card.
+        if best>1.25 || second-best<0.36 {return None;}
+        if changed<3.5 {return None;}
+        let chosen=selected_geometry_for_slot(slot,after);
+        Some(MatchingTile{
+            rect:chosen,
+            loss:best,
+            runner_up_loss:second,
+            change_score:changed,
+        })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs,time::SystemTime};
+    fn synthetic()->(Shot,Shot,MediaBox){
+        let mut before=Shot::for_test(700,590);
+        let mut after=Shot::for_test(700,590);
+        let old=MediaBox{left:120,top:150,right:236,bottom:228};
+        let new=MediaBox{left:256,top:150,right:372,bottom:228};
+        before.paint_for_test(old,(220,55,55));
+        after.paint_for_test(old,(220,55,55));
+        after.paint_for_test(new,(20,70,220));
+        (before,after,new)
+    }
+    fn png_for_test()->std::path::PathBuf{
+        let path=std::env::temp_dir().join(format!("clipbridge-fingerprint-{:?}.png",
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()));
+        let file=File::create(&path).unwrap();
+        let mut encoder=png::Encoder::new(file,116,78);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer=encoder.write_header().unwrap();
+        writer.write_image_data(&[20u8,70,220].repeat(116*78)).unwrap();
+        path
+    }
+    #[test] fn matching_png_finds_new_tile_not_old(){
+        let path=png_for_test();
+        let reference=Reference::from_png(&path).unwrap();
+        let (before,after,new)=synthetic();
+        let located=reference.locate(&before,&after).expect("blue source is new Media tile");
+        assert_eq!(located.rect,new);
+        assert!(located.change_score>10.0);
+        fs::remove_file(path).unwrap();
+    }
+    #[test] fn unchanged_screen_does_not_claim_new_import(){
+        let path=png_for_test();
+        let reference=Reference::from_png(&path).unwrap();
+        let (_,shot,_)=synthetic();
+        assert!(reference.locate(&shot,&shot).is_none());
+        fs::remove_file(path).unwrap();
+    }
+}
