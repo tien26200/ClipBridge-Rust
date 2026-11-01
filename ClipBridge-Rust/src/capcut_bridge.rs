@@ -4,7 +4,7 @@
 //! Uses no physical cursor motion, no project file edits, no clipboard writes.
 //! Still uses an invisible Windows file chooser and synthetic window messages.
 //! This is NOT a public CapCut API and requires real-version testing.
-use crate::capcut_vision::{capture_media, find_imported_media, media_diagnostic, MediaBox};
+use crate::capcut_vision::{capture_media, find_imported_media, media_diagnostic, selected_media, needs_select_new_tile, MediaBox};
 use std::{
     mem::{size_of,zeroed},
     os::windows::ffi::OsStrExt,
@@ -247,6 +247,27 @@ unsafe fn packed_point(point:POINT)->isize {
     let y=point.y as u32 & 0xffff;
     ((y<<16)|x) as isize
 }
+// On an unselected second thumbnail the '+' hotspot may not be active.
+// Select only the newly changed Media tile, without moving the physical
+// cursor. Never select the old highlighted tile.
+unsafe fn native_select_media_tile(editor:HWND,b:MediaBox)->Result<(),String>{
+    let rect=bounds(editor);
+    let point=POINT{
+        x:rect.left+(b.left+b.right)/2,
+        y:rect.top+(b.top+b.bottom)/2,
+    };
+    let mut client=point;
+    if ScreenToClient(editor,&mut client)==0 {
+        return Err("Cannot map new Media thumbnail center".into());
+    }
+    let pos=packed_point(client);
+    if PostMessageW(editor,WM_LBUTTONDOWN,1usize,pos)==0 ||
+        PostMessageW(editor,WM_LBUTTONUP,0,pos)==0 {
+        return Err("Could not select newly imported Media item".into());
+    }
+    Ok(())
+}
+
 unsafe fn native_add_to_track(editor:HWND,b:MediaBox)
     ->Result<(i32,i32),String>{
     let rect=bounds(editor);
@@ -349,7 +370,38 @@ pub unsafe fn import_then_add(
     if GetClipboardSequenceNumber()!=job.sequence {
         return Err("Clipboard changed during import; refusing to add a stale image".into());
     }
-    let (x,y)=native_add_to_track(editor,box_)?;
+    let mut target=box_;
+    let current_selection=last_media.as_ref().and_then(selected_media);
+    if needs_select_new_tile(box_,current_selection) {
+        trace("MEDIA_SELECTION_STALE selecting_new_tile=true");
+        // Keep the main (+) click unchanged from the user's working 0.7.4.
+        // Only perform this preparatory selection for an unselected B/C card.
+        native_select_media_tile(editor,box_)?;
+        let settle=Instant::now()+Duration::from_millis(720);
+        let mut confirmed=false;
+        while Instant::now()<settle {
+            thread::sleep(Duration::from_millis(95));
+            if !editor_is_foreground(editor) || GetClipboardSequenceNumber()!=job.sequence {
+                return Err("Focus or clipboard changed while selecting new Media".into());
+            }
+            let selection_shot=capture_media(editor)?;
+            if let Some(selected)=selected_media(&selection_shot) {
+                if selected.overlaps(box_) {
+                    target=selected;
+                    confirmed=true;
+                    break;
+                }
+            }
+        }
+        if !confirmed {
+            trace("MEDIA_SELECT_NOT_CONFIRMED");
+            return Err("New Media tile not selected; refused to click stale Add (+) target".into());
+        }
+        trace("MEDIA_SELECT_CONFIRMED target=new_import");
+    } else {
+        trace("MEDIA_SELECTION_ALREADY_MATCHED_OR_UNAVAILABLE");
+    }
+    let (x,y)=native_add_to_track(editor,target)?;
     trace(&format!("ADD_TO_TRACK_SENT target=editor client_x={x} client_y={y} result_not_verified"));
-    Ok(ImportReport{box_,visual_change:score,elapsed_ms:started.elapsed().as_millis()})
+    Ok(ImportReport{box_:target,visual_change:score,elapsed_ms:started.elapsed().as_millis()})
 }
