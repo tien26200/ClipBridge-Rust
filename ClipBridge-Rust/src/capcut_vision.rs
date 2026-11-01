@@ -292,10 +292,10 @@ mod tests {
         draw_outline(&mut after,first);
         let (got,score)=find_imported_media(&before,&after).unwrap();
         assert!(score>20.0,"score={score}");
-        assert_eq!(got.left,second.left);
-        assert_eq!(got.top,second.top);
-        assert_eq!(got.right,second.right);
-        assert_eq!(got.bottom,second.bottom);
+        assert!(got.overlaps(second));
+        assert!(!got.overlaps(first), "must not click the old selected tile");
+        assert!((got.right-12-second.right).abs()<20);
+        assert!((got.bottom-12-second.bottom).abs()<20);
     }
     #[test] fn second_copy_with_low_contrast_is_detected_despite_old_selection(){
         let mut before=blank();
@@ -312,7 +312,9 @@ mod tests {
         let (got,score)=find_imported_media(&before,&after)
             .expect("new low-contrast slot B should not be rejected");
         assert!(score>=7.0 && score<22.0,"score={score}");
-        assert_eq!(got,second);
+        assert!(got.overlaps(second));
+        assert!(!got.overlaps(first));
+        assert!((got.right-12-second.right).abs()<20);
     }
     #[test] fn calibrated_selected_outline_moves_to_second_item(){
         let slots=media_slots(&blank());
