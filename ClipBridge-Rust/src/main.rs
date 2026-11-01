@@ -1168,7 +1168,7 @@ fn main() {
         let (log_tx, log_thread) = start_logger(log_path.clone());
         let preferences=prefs_path();
         let saved_prefs=load_preferences(&preferences);
-        log_event(&log_tx,format!("START version=0.7.3 auto_add={} block_native={} clear_after_import={}",
+        log_event(&log_tx,format!("START version=0.7.4 auto_add={} block_native={} clear_after_import={}",
             saved_prefs.auto_add,saved_prefs.block_native,saved_prefs.clear_after_import));
         let mut app = Box::new(App {
             folder,
