@@ -140,20 +140,23 @@ pub fn find_imported_media(before:&Shot,after:&Shot)->Option<(MediaBox,f64)> {
     let before_selected=selected_media(before);
     let after_selected=selected_media(after);
     let changed=changed_media(before,after);
-    if let Some(selected)=after_selected {
-        if before_selected!=Some(selected) {
-            // Strongest signal: a newly selected tile overlaps the changed grid
-            // slot. Avoid acting on a prior selection that stays unchanged.
-            if let Some((changed_rect,score))=changed {
-                if changed_rect.overlaps(selected) && score>=8.0 {
-                    return Some((selected,score));
-                }
-            }
+    if let (Some(selected),Some((changed_rect,score)))=(after_selected,changed) {
+        // A media deletion can cause the next import to reuse the SAME visual
+        // slot and selected outline as the deleted media. In that case
+        // before_selected == after_selected, yet the TILE CONTENT changed.
+        // The old logic incorrectly rejected it and required score>=20.
+        // A matching selection outline + a clear tile-content difference is
+        // stronger evidence than the outline moving to a different slot.
+        if changed_rect.overlaps(selected) && score>=8.0 {
+            return Some((selected,score));
         }
     }
-    // Grid fallback only when enough visual evidence exists. A false positive
-    // here clicks a different tile, so prefer to fail rather than guess.
-    changed.filter(|(_,score)|*score>=20.0)
+    // If no selection moved and the strongest changed tile is elsewhere,
+    // use the grid rectangle only with strong visual evidence.
+    let fallback_threshold=if before_selected.is_none() && after_selected.is_none(){
+        20.0
+    } else {22.0};
+    changed.filter(|(_,score)|*score>=fallback_threshold)
 }
 
 #[cfg(test)]
@@ -174,6 +177,37 @@ mod tests {
         let found=find_imported_media(&before,&after);
         assert!(found.is_some());
         assert!(found.unwrap().1>=20.0);
+    }
+    fn draw_outline(shot:&mut Shot,rect:MediaBox){
+        // Approximate a cyan CapCut selection border.
+        for x in rect.left..rect.right {
+            for y in [rect.top,rect.bottom-1]{
+                let p=((y as usize*shot.w)+x as usize)*4;
+                shot.bytes[p]=220;shot.bytes[p+1]=200;shot.bytes[p+2]=0;
+            }
+        }
+    }
+    #[test] fn reuses_same_selected_slot_after_old_media_was_removed(){
+        let mut before=blank();
+        let mut after=blank();
+        let selected=MediaBox {left:120,top:150,right:236,bottom:228};
+        draw_rect(&mut before,selected,(45,75,75));
+        draw_rect(&mut after,selected,(45,107,75)); // average RGB delta ~10.7
+        draw_outline(&mut before,selected);
+        draw_outline(&mut after,selected);
+        let detected=find_imported_media(&before,&after);
+        assert!(detected.is_some(),
+            "new media in the same slot must not require a moved outline");
+        let (actual,score)=detected.unwrap();
+        assert!(score>=8.0 && score<20.0,"score={score}");
+        assert!(actual.overlaps(selected));
+    }
+    #[test] fn no_deletion_no_pixel_change_means_no_click(){
+        let mut shot=blank();
+        let rect=MediaBox{left:120,top:150,right:236,bottom:228};
+        draw_rect(&mut shot,rect,(45,107,75));
+        draw_outline(&mut shot,rect);
+        assert!(find_imported_media(&shot,&shot).is_none());
     }
     #[test] fn unchanged_media_is_not_clicked() {
         let s=blank(); assert!(find_imported_media(&s,&s).is_none());
