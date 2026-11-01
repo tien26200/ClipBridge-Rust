@@ -3,6 +3,9 @@ use clipbridge::{encode, prepare_folder, save_setting, store_png, Capture, MAX_B
 use std::{
     ffi::{OsStr, OsString},
     fs,
+    fs::OpenOptions,
+    io::Write,
+    time::{Instant, SystemTime, UNIX_EPOCH},
     mem::{size_of, zeroed},
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
@@ -27,6 +30,8 @@ const PAUSE: isize = 106;
 const EXIT: isize = 107;
 const STATUS: isize = 108;
 const SHOW: isize = 109;
+const LOG: isize = 110;
+const LOG_LIMIT: u64 = 2 * 1024 * 1024;
 struct Job {
     capture: Capture,
     folder: PathBuf,
@@ -56,6 +61,73 @@ struct App {
     icon_small: HICON,
     taskbar_created: u32,
     worker: Option<std::thread::JoinHandle<()>>,
+    log_tx: SyncSender<String>,
+    log_path: PathBuf,
+}
+
+// Async diagnostic logging: bounded queue, small single writer, no clipboard payload.
+// %LOCALAPPDATA%/ClipBridge/clipbridge.log; previous rotated at 2 MiB.
+fn logger_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ClipBridge")
+        .join("clipbridge.log")
+}
+fn start_logger(path: PathBuf) -> (SyncSender<String>, std::thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::sync_channel::<String>(256);
+    let thread = std::thread::spawn(move || {
+        let Some(dir) = path.parent() else { return; };
+        if fs::create_dir_all(dir).is_err() { return; }
+        let old = path.with_extension("old.log");
+        let mut count = 0u32;
+        let mut writer = None;
+        for line in rx {
+            if writer.is_none() {
+                if fs::metadata(&path).is_ok_and(|m| m.len() >= LOG_LIMIT) {
+                    let _ = fs::remove_file(&old);
+                    let _ = fs::rename(&path, &old);
+                }
+                writer = OpenOptions::new().create(true).append(true).open(&path).ok();
+            }
+            if let Some(file) = &mut writer {
+                let _ = writeln!(file, "{line}");
+            }
+            count += 1;
+            if count >= 64 {
+                count = 0;
+                if let Some(file) = &mut writer { let _ = file.flush(); }
+                if fs::metadata(&path).is_ok_and(|m| m.len() >= LOG_LIMIT) {
+                    writer = None;
+                }
+            }
+        }
+    });
+    (tx, thread)
+}
+fn log_event(tx: &SyncSender<String>, description: impl AsRef<str>) {
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH)
+        .unwrap_or_default().as_millis();
+    let _ = tx.try_send(format!("{millis} | {}", description.as_ref()));
+}
+unsafe fn clipboard_metadata() -> String {
+    let owner = GetClipboardOwner();
+    let mut pid = 0u32;
+    if !owner.is_null() {
+        GetWindowThreadProcessId(owner, &mut pid);
+    }
+    // Enumerate format IDs only: never capture text, image data or window titles in logs.
+    let mut formats = Vec::with_capacity(12);
+    if OpenClipboard(null_mut()) != 0 {
+        let mut id = 0u32;
+        for _ in 0..24 {
+            id = EnumClipboardFormats(id);
+            if id == 0 { break; }
+            formats.push(id);
+        }
+        CloseClipboard();
+    }
+    format!("owner_pid={pid} formats={formats:?}")
 }
 
 fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
@@ -127,7 +199,8 @@ unsafe fn open_path(hwnd: HWND, path: &Path) {
 }
 
 // Copy only image formats. Text, browser history and private CapCut formats are never read.
-unsafe fn read_capture(hwnd: HWND) -> Result<Option<Capture>, String> {
+unsafe fn read_capture(app: &App) -> Result<Option<Capture>, String> {
+    let hwnd = app.main;
     let png = RegisterClipboardFormatW(wide("PNG").as_ptr());
     let kind = if IsClipboardFormatAvailable(png) != 0 {
         png
@@ -155,6 +228,7 @@ unsafe fn read_capture(hwnd: HWND) -> Result<Option<Capture>, String> {
             return Err("Không khóa được dữ liệu clipboard".into());
         }
         let bytes = std::slice::from_raw_parts(p as *const u8, len).to_vec();
+        log_event(&app.log_tx, format!("CAPTURE_READ kind={} bytes={len}", if kind==png {"PNG"} else if kind==17 {"DIBV5"} else {"DIB"}));
         GlobalUnlock(h);
         Ok(Some(if kind == png {
             Capture::Png(bytes)
@@ -176,10 +250,12 @@ unsafe fn capture(app: &mut App) {
     }
     if app.outstanding >= 2 {
         app.pending_seq = seq;
+        log_event(&app.log_tx, format!("CAPTURE_BACKPRESSURE seq={seq} outstanding={}", app.outstanding));
         SetTimer(app.main, 1, 200, None);
         return;
     }
-    match read_capture(app.main) {
+    let began = Instant::now();
+    match read_capture(app) {
         Ok(Some(c)) => {
             match app.tx.try_send(Job {
                 capture: c,
@@ -187,6 +263,7 @@ unsafe fn capture(app: &mut App) {
                 sequence: seq,
             }) {
                 Ok(()) => {
+                    log_event(&app.log_tx, format!("CAPTURE_ENQUEUED seq={seq} outstanding={} elapsed_ms={}", app.outstanding+1, began.elapsed().as_millis()));
                     app.outstanding += 1;
                     app.last_seq = seq;
                     text(app.status, "Đang lưu ảnh…");
@@ -196,6 +273,7 @@ unsafe fn capture(app: &mut App) {
                 Err(mpsc::TrySendError::Full(_)) => {
                     text(app.status, "Đang xử lý ảnh trước; ảnh mới sẽ được thử lại.");
                     app.pending_seq = seq;
+                    log_event(&app.log_tx, format!("CAPTURE_QUEUE_FULL seq={seq}"));
                     SetTimer(app.main, 1, 200, None);
                 }
                 Err(_) => {
@@ -208,11 +286,13 @@ unsafe fn capture(app: &mut App) {
             }
         }
         Ok(None) => {
+            log_event(&app.log_tx, format!("CLIPBOARD_IGNORED seq={seq} reason=no_supported_image"));
             app.last_seq = seq;
             app.retries = 0;
             KillTimer(app.main, 1);
         }
         Err(e) => {
+            if app.retries == 0 { log_event(&app.log_tx, format!("CAPTURE_RETRY seq={seq} reason={e}")); }
             text(app.status, &e);
             if app.retries < 10 {
                 app.retries += 1;
@@ -307,9 +387,10 @@ unsafe fn copy_path(app: &mut App) {
     match write_path(app.main, path) {
         Ok(()) => {
             app.last_seq = GetClipboardSequenceNumber();
+            log_event(&app.log_tx, "MANUAL_COPY_PATH success clipboard_replaced=true");
             text(app.status, "Đã copy đường dẫn dạng text (clipboard ảnh gốc đã được thay).");
         }
-        Err(e) => text(app.status, &e),
+        Err(e) => { log_event(&app.log_tx, format!("MANUAL_COPY_PATH error={e}")); text(app.status, &e); },
     }
 }
 fn newer_or_same_sequence(candidate: u32, previous: u32) -> bool {
@@ -318,6 +399,7 @@ fn newer_or_same_sequence(candidate: u32, previous: u32) -> bool {
 
 unsafe fn pause(app: &mut App) {
     app.paused = !app.paused;
+    log_event(&app.log_tx, format!("PAUSE changed={}", app.paused));
     text(
         app.pause,
         if app.paused {
@@ -544,6 +626,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 0,
             );
             a.clipboard_registered = AddClipboardFormatListener(hwnd) != 0;
+            log_event(&a.log_tx, format!("LISTENER registered={}", a.clipboard_registered));
             if !a.clipboard_registered {
                 text(a.status,"Không đăng ký được clipboard listener. Hãy mở lại ứng dụng bằng tài khoản desktop.");
             }
@@ -560,6 +643,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
         WM_CLIPBOARDUPDATE => {
             let a = &mut *p;
+            let seq = GetClipboardSequenceNumber();
+            if seq != a.last_seq { log_event(&a.log_tx, format!("CLIPBOARD_UPDATE seq={seq} {}", clipboard_metadata())); }
             a.retries = 0;
             capture(a);
             0
@@ -585,10 +670,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     if a.latest_sequence.is_none_or(|prev| newer_or_same_sequence(sequence, prev)) {
                         a.latest = Some(path.clone());
                         a.latest_sequence = Some(sequence);
+                        log_event(&a.log_tx, format!("SAVE_OK seq={sequence} filename={} clipboard_current_seq={} unchanged_by_app=true", path.file_name().unwrap_or_default().to_string_lossy(), GetClipboardSequenceNumber()));
                         text(a.status, &format!("Đã lưu PNG: {} (giữ clipboard ảnh gốc)", path.display()));
                     }
                 }
-                Err(e) => text(a.status, &format!("Không lưu được ảnh: {e}")),
+                Err(e) => { log_event(&a.log_tx, format!("SAVE_ERROR seq={sequence} error={e}")); text(a.status, &format!("Không lưu được ảnh: {e}")); },
             }
             0
         }
@@ -609,6 +695,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     open_path(hwnd, &folder);
                 }
                 COPY => copy_path(&mut *p),
+                LOG => { let path = (*p).log_path.clone(); open_path(hwnd, &path); },
                 PAUSE => pause(&mut *p),
                 SHOW => show(&*p),
                 EXIT => {
@@ -653,6 +740,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             if a.tray.uID != 0 {
                 Shell_NotifyIconW(NIM_DELETE, &a.tray);
             }
+            log_event(&a.log_tx, "SHUTDOWN requested");
             PostQuitMessage(0);
             0
         }
@@ -705,6 +793,9 @@ fn main() {
             LR_SHARED,
         ) as HICON;
         let (tx, rx) = mpsc::sync_channel::<Job>(1);
+        let log_path = logger_path();
+        let (log_tx, log_thread) = start_logger(log_path.clone());
+        log_event(&log_tx, "START version=0.5.1 logging=metadata_only clipboard_auto_write=false");
         let mut app = Box::new(App {
             folder,
             config,
@@ -729,6 +820,8 @@ fn main() {
             },
             taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
             worker: None,
+            log_tx: log_tx.clone(),
+            log_path,
         });
         let class = wide("ClipBridgeRustWindow");
         let wc = WNDCLASSW {
@@ -775,9 +868,12 @@ fn main() {
         SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon_large as isize);
         window_shadow(hwnd);
         let target = hwnd as usize;
+        let worker_log = log_tx.clone();
         app.worker = Some(std::thread::spawn(move || {
             for job in rx {
+                let start = Instant::now();
                 let result = encode(job.capture).and_then(|png| store_png(&png, &job.folder));
+                log_event(&worker_log, format!("WORKER_FINISHED seq={} success={} duration_ms={}", job.sequence, result.is_ok(), start.elapsed().as_millis()));
                 let raw = Box::into_raw(Box::new(Saved {
                     result,
                     sequence: job.sequence,
@@ -810,6 +906,9 @@ fn main() {
         if com >= 0 {
             CoUninitialize();
         }
+        log_event(&log_tx, "EXIT");
+        drop(log_tx);
+        let _ = log_thread.join();
         CloseHandle(mutex);
     }
 }
