@@ -22,7 +22,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::{Dwm::*, Gdi::*},
-    System::{Com::*, DataExchange::*, LibraryLoader::*, Memory::*, Threading::*, Time::*},
+    System::{Com::*, DataExchange::*, LibraryLoader::*, Memory::*, Threading::*, SystemInformation::*},
     UI::{Controls::MARGINS, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
 };
 
