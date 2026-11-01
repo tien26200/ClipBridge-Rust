@@ -1,4 +1,4 @@
-# ClipBridge Rust v0.8.0
+# ClipBridge Rust v0.8.1
 
 Windows clipboard-image capture → named PNG saved immediately at Ctrl+C
 → CapCut Media import → guarded timeline placement.
@@ -9,7 +9,15 @@ It never read CapCut's playhead. It sent a click to the Media thumbnail's
 small '+' control; CapCut decided the timeline insertion position.
 Fixing thumbnail detection alone could never enforce playhead alignment.
 
-## v0.8.0 — two explicit placement modes
+## v0.8.1 — new-row first image fix
+
+The Media scanner now searches both a bounded horizontal offset (±70px)
+and a vertical offset (±84px). This addresses the observed first thumbnail
+on a new Media row whose position can shift in BOTH dimensions. The source
+PNG match is required when auto-scanning reflowed candidates, and the
+physical target is re-confirmed before playhead drag.
+
+## v0.8.1 — two explicit placement modes
 
 **Playhead placement (default ON, experimental):**
 - Read the actual vertical ruler/playhead marker in a full-editor,
