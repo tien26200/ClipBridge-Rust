@@ -1,0 +1,16 @@
+[package]
+name = "clipbridge"
+version = "0.4.1"
+edition = "2021"
+
+[dependencies]
+png = "0.18"
+sha2 = "0.10"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Com", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Security", "Win32_UI_Shell_Common", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_Controls", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

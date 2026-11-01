@@ -1,0 +1,65 @@
+name: Build ClipBridge Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - '.github/workflows/windows-build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    name: Test and build (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable (x64 MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Configure MSVC and Windows SDK (rc.exe)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        shell: pwsh
+        run: cargo test --locked
+
+      - name: Build release EXE
+        shell: pwsh
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package EXE with SHA256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/clipbridge.exe' 'dist/ClipBridge.exe'
+          (Get-FileHash 'dist/ClipBridge.exe' -Algorithm SHA256).Hash.ToLower() + '  ClipBridge.exe' |
+            Set-Content -Path 'dist/SHA256.txt' -Encoding ascii
+          Copy-Item 'VALIDATION.md' 'dist/TESTING.md'
+          Compress-Archive -Path 'dist/*' -DestinationPath 'ClipBridge-Rust-v0.4.1-Windows-x64.zip' -Force
+
+      - name: Upload compiled EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipBridge-Rust-v0.4.1-Windows-x64
+          path: ClipBridge-Rust-v0.4.1-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
