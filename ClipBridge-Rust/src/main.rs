@@ -1281,7 +1281,7 @@ fn main() {
         let saved_prefs=load_preferences(&preferences);
         let project_file=logger_path().with_file_name("project_override.txt");
         let manual_project=fs::read_to_string(&project_file).unwrap_or_default();
-        log_event(&log_tx,format!("START version=0.7.7 auto_add={} block_native={} clear_after_import={}",
+        log_event(&log_tx,format!("START version=0.7.8 auto_add={} block_native={} clear_after_import={}",
             saved_prefs.auto_add,saved_prefs.block_native,saved_prefs.clear_after_import));
         let mut app = Box::new(App {
             folder,
