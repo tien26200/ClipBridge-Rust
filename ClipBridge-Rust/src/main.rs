@@ -1,13 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-use clipbridge::{encode, prepare_folder, save_setting, store_png, Capture, MAX_BYTES};
+use clipbridge::{encode, prepare_folder, save_setting, store_png_named, Capture, MAX_BYTES};
 mod timeline_bridge;
 mod capcut_bridge;
 mod capcut_vision;
+mod project_name;
 use timeline_bridge::{TimelineBridge, UnsupportedCapCutAdapter};
 use capcut_bridge::ImportJob;
 use std::{
     ffi::{OsStr, OsString},
     fs,
+    collections::HashMap,
     fs::OpenOptions,
     io::Write,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -20,7 +22,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::{Dwm::*, Gdi::*},
-    System::{Com::*, DataExchange::*, LibraryLoader::*, Memory::*, Threading::*},
+    System::{Com::*, DataExchange::*, LibraryLoader::*, Memory::*, Threading::*, Time::*},
     UI::{Controls::MARGINS, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
 };
 
@@ -39,12 +41,14 @@ const LOG: isize = 110;
 const AUTO_ADD: isize = 112;
 const BLOCK_NATIVE: isize = 113;
 const CLEAR_AFTER: isize = 114;
+const PROJECT_NAME_SAVE: isize = 115;
 const WM_IMPORT_FINISHED: u32 = WM_APP + 4;
 const LOG_LIMIT: u64 = 2 * 1024 * 1024;
 struct Job {
     capture: Capture,
     folder: PathBuf,
     sequence: u32,
+    project_override: String,
 }
 struct Saved {
     result: Result<PathBuf, String>,
@@ -58,6 +62,9 @@ struct App {
     folder: PathBuf,
     config: PathBuf,
     preferences: PathBuf,
+    project_file: PathBuf,
+    manual_project: String,
+    project_edit: HWND,
     block_native: bool,
     clear_after_import: bool,
     latest: Option<PathBuf>,
@@ -328,6 +335,14 @@ unsafe fn read_capture(app: &App) -> Result<Option<Capture>, String> {
     result
 }
 
+// Date is read from the local Windows calendar, not UTC, so a copy
+// just after midnight is named for the correct day on this computer.
+fn local_date_stamp()->String {
+    let mut value:SYSTEMTIME=unsafe{zeroed()};
+    unsafe{GetLocalTime(&mut value);}
+    format!("{:02}-{:02}-{:04}",value.wDay,value.wMonth,value.wYear)
+}
+
 unsafe fn capture(app: &mut App) {
     if app.paused {
         return;
@@ -349,6 +364,7 @@ unsafe fn capture(app: &mut App) {
                 capture: c,
                 folder: app.folder.clone(),
                 sequence: seq,
+                project_override: app.manual_project.clone(),
             }) {
                 Ok(()) => {
                     log_event(&app.log_tx, format!("CAPTURE_ENQUEUED seq={seq} outstanding={} elapsed_ms={}", app.outstanding+1, began.elapsed().as_millis()));
@@ -885,6 +901,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 26,
                 0,
             );
+            control(hwnd,"STATIC",
+                "Tên project cho file PNG (để trống = tự nhận diện CapCut)",
+                0,20,479,650,22,0);
+            a.project_edit=control(hwnd,"EDIT",&a.manual_project,0,
+                20,506,505,29,WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL as u32);
+            control(hwnd,"BUTTON","Lưu tên project",
+                PROJECT_NAME_SAVE,535,506,135,29,WS_TABSTOP);
             a.clipboard_registered = AddClipboardFormatListener(hwnd) != 0;
             log_event(&a.log_tx, format!("LISTENER registered={}", a.clipboard_registered));
             if !a.clipboard_registered {
@@ -1061,6 +1084,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     log_event(&a.log_tx,format!("CLEAR_AFTER_IMPORT enabled={}",a.clear_after_import));
                     if let Err(e)=save_preferences(a){log_event(&a.log_tx,format!("PREFS_WRITE_FAILED {e}"));}
                 },
+                PROJECT_NAME_SAVE => {
+                    let a=&mut *p;
+                    let value=get_text(a.project_edit).trim().to_string();
+                    if value.chars().count()>90 {
+                        text(a.status,"Tên project quá dài (tối đa 90 ký tự).");
+                    } else {
+                        let path=&a.project_file;
+                        let result=path.parent().map(|d|fs::create_dir_all(d))
+                            .unwrap_or(Ok(())).and_then(|_|fs::write(path,&value));
+                        match result {
+                            Ok(())=>{
+                                a.manual_project=value;
+                                text(a.status,if a.manual_project.is_empty(){
+                                    "Tên PNG: tự nhận diện project CapCut khi copy ảnh."
+                                }else{
+                                    "Đã lưu tên project cho PNG. Các ảnh copy tiếp theo sẽ dùng tên này."
+                                });
+                                log_event(&a.log_tx,format!(
+                                    "PROJECT_NAME_MODE mode={} (file names only)",
+                                    if a.manual_project.is_empty(){"automatic"}else{"manual"}));
+                            }
+                            Err(e)=>text(a.status,&format!("Không lưu được tên project: {e}"))
+                        }
+                    }
+                },
                 LOG => { let path = (*p).log_path.clone(); open_path(hwnd, &path); },
                 PAUSE => pause(&mut *p),
                 SHOW => show(&*p),
@@ -1168,12 +1216,17 @@ fn main() {
         let (log_tx, log_thread) = start_logger(log_path.clone());
         let preferences=prefs_path();
         let saved_prefs=load_preferences(&preferences);
-        log_event(&log_tx,format!("START version=0.7.4 auto_add={} block_native={} clear_after_import={}",
+        let project_file=logger_path().with_file_name("project_override.txt");
+        let manual_project=fs::read_to_string(&project_file).unwrap_or_default();
+        log_event(&log_tx,format!("START version=0.7.5 auto_add={} block_native={} clear_after_import={}",
             saved_prefs.auto_add,saved_prefs.block_native,saved_prefs.clear_after_import));
         let mut app = Box::new(App {
             folder,
             config,
             preferences,
+            project_file,
+            manual_project,
+            project_edit:null_mut(),
             block_native: saved_prefs.block_native,
             clear_after_import: saved_prefs.clear_after_import,
             latest: None,
@@ -1232,7 +1285,7 @@ fn main() {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             710,
-            510,
+            590,
             null_mut(),
             null_mut(),
             instance,
@@ -1277,9 +1330,19 @@ fn main() {
             }
         }));
         app.worker = Some(std::thread::spawn(move || {
+            // Cached counters are isolated to this writer. They are rebuilt
+            // from existing filenames once per project/day after restart.
+            let mut counters:HashMap<(PathBuf,String,String),u32>=HashMap::new();
             for job in rx {
                 let start = Instant::now();
-                let result = encode(job.capture).and_then(|png| store_png(&png, &job.folder));
+                // The name belongs to the PNG SAVED AT COPY TIME,
+                // not to any existing filename inside CapCut Media.
+                let label=project_name::detect_project(&job.project_override);
+                let date=local_date_stamp();
+                log_event(&worker_log,format!("NAMING seq={} project={} via={} date={}",
+                    job.sequence,label.name,label.source,date));
+                let result=encode(job.capture).and_then(|png|
+                    store_png_named(&png,&job.folder,&label.name,&date,&mut counters));
                 log_event(&worker_log, format!("WORKER_FINISHED seq={} success={} duration_ms={}", job.sequence, result.is_ok(), start.elapsed().as_millis()));
                 let raw = Box::into_raw(Box::new(Saved {
                     result,
