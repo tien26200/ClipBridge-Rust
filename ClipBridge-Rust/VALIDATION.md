@@ -1,59 +1,48 @@
-# ClipBridge Rust v0.7.8 — tested logic, live CapCut confirmation pending
+# ClipBridge Rust v0.7.9 — row boundary / first column regression
 
-## User's v0.7.7 evidence
-Clipboard seq=570: source A imported, selected thumbnail detected,
-Add message posted. This is not definitive evidence CapCut inserted the clip.
-Clipboard seq=579: source B imported, then 22 screenshots showed three
-large, competing changes (217/201/198) and no selected tile; no Add sent.
-Retrying the same source B re-imported B again and posted an uncertain
-Add message using only 5.4 visual-difference score.
+## Reported real-world symptom
+The first newly imported thumbnail on a NEW row in CapCut's Media view
+appears in Media but cannot be added to the timeline by ClipBridge.
+This is a position-related failure, rather than necessarily image B.
 
-## Improvements
-1. Import identity is the clipboard sequence + exactly saved PNG path;
-   never alter the CapCut project file or PNG after import.
-2. Track each sequence as new / Import attempted / Add message sent.
-   On a later Ctrl+V for a sequence with Import attempted, find the
-   already imported B. Do not submit Ctrl+I or duplicate its Media entry.
-3. Build a sparse RGB histogram of source PNG in the existing import worker
-   and compare it with visible Media thumbnails. Require a strong unique
-   source match. This is approximate, not a pixel-perfect identity test.
-4. If source match is unavailable, allow a fallback only if the new
-   thumbnail has moved into a selected state with a visual score >=20.
-   Prevent low-confidence 5.4-score repeated clicks.
-5. If B is not selected (even if NOTHING is selected), select B by direct
-   HWND messages, confirm its cyan highlight, then send the known-good
-   Add (+) message pair once, without moving the physical pointer.
-6. If the import appears to have finished but B is not visible, fail
-   safely and log an explanation, rather than clicking another thumbnail.
-7. Do not auto-repeat Add for a sequence after sending a click. It
-   might have worked; repeating would create timeline duplicates.
+## Changes
+- Search ±84 vertical pixels around each expected thumbnail row,
+  constrained to fully visible Media area. Do not assume the old
+  grid y-coordinate is the current visible y-coordinate.
+- Compare sampled Media candidates against the saved PNG RGB histogram.
+- Group adjacent scan offsets belonging to one physical thumbnail before
+  computing margin, otherwise adjacent offsets can falsely be interpreted
+  as multiple independent pictures.
+- Keep confirmation across two screenshots.
+- After selecting thumbnail, *re-find* source on the current UI frame;
+  CapCut may have scrolled again during selection. Confirm the selected
+  rectangle belongs to the source before pressing Add (+).
+- Preserve per-image no-duplicate Import state and original direct click.
+- No image pixels are saved; logs contain coordinates and confidence only.
 
-## Live regression checklist
-- Exit ClipBridge fully (including tray) and start v0.7.8.
-- Set Auto Add ON, Block Native ON, Clear Clipboard OFF.
-- In a disposable CapCut project with visible Media panel:
-  copy image A outside CapCut, Ctrl+V, inspect Media + timeline;
-  copy a DIFFERENT image B, Ctrl+V, inspect Media + timeline.
-- Repeat Ctrl+V for B after a failed Add: it must NOT import a second B
-  into Media, and should attempt to identify the first B.
-- If Add already reported "sent", a second Ctrl+V of same clipboard
-  will be ignored to avoid duplicate clips. Ctrl+C again to retry.
-- Repeat with similar-looking images, B after Media reflow/deletion,
-  and alternative CapCut window layouts.
-- Review `%LOCALAPPDATA%\ClipBridge\clipbridge.log` for:
-  IMAGE_TRACK_CREATED, IMAGE_STATE, SOURCE_FINGERPRINT_READY,
-  SOURCE_MATCH_CONFIDENT, MEDIA_SOURCE_MATCH_STABLE,
-  MEDIA_SELECTION_STALE, MEDIA_SELECT_CONFIRMED,
-  MEDIA_DIAGNOSTIC, IMPORT_FAILED, IMPORT_ALREADY_ADD_SENT.
-- Verify PNG files still use project + STT + local date at copy time;
-  Settings and circular three-colour icon are unchanged.
+## Must test in CapCut itself
+1. Exit old ClipBridge from tray; launch v0.7.9.
+2. Set Auto Add ON; Block Native ON; Clear Clipboard OFF.
+3. Start a disposable project, show Media panel and keep its width fixed.
+4. Copy/paste enough DIFFERENT PNGs to fill row 1.
+5. Copy/paste the FIRST photo of row 2; check that it enters both Media
+   and timeline, not only Media.
+6. Repeat at the FIRST photo of rows 3 and 4, and after deleting an old
+   Media item or after CapCut scrolls the list.
+7. Retry Ctrl+V after unsuccessful Import: should try existing Media
+   without reimporting duplicated PNGs.
+8. Check names `Project_001_DD-MM-YYYY.png` continue incrementing,
+   Settings persist and the three-colour circular icon is unchanged.
+9. If it fails, share
+   `%LOCALAPPDATA%\ClipBridge\clipbridge.log`. Search the failing seq for
+   `MEDIA_SOURCE_DIAGNOSTIC`, `MEDIA_ROW_REFLOW`,
+   `MEDIA_SELECTION_RELOCATED`, `MEDIA_SELECT_CONFIRMED`,
+   `MEDIA_SELECT_NOT_CONFIRMED`, `ADD_TO_TRACK_SENT` and `IMPORT_FAILED`.
+10. A command logged as ADD_TO_TRACK_SENT means only the HWND click was
+    posted. It does NOT verify a new timeline clip was actually created.
 
-## Limitations and safeguards
-There is NO verified CapCut public timeline API. A posted HWND click is
-not proof of a clip on timeline, so the app must not claim completion.
-When the UI metadata and visual evidence are insufficient, the importer
-stops without clicking. It might still fail on custom Qt layouts,
-offscreen Media thumbnails, DPI scaling and visually similar images.
-No screenshots or PNG samples are stored in the diagnostics.
-The EXE is unsigned; scan with Windows Defender and test a disposable
-project before using it in production.
+## Limits
+The source match is an approximate RGB histogram, not an exact identity
+proof. Media thumbnails must remain visible and sufficiently distinguishable
+in CapCut's specific version, zoom and layout. It may refuse to add when
+several candidates look similar. The executable is unsigned.
