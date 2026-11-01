@@ -41,13 +41,21 @@ impl Shot {
     }
 }
 pub unsafe fn capture_media(hwnd: HWND)->Result<Shot,String> {
+    capture_window(hwnd,false)
+}
+/// Full editor screenshot in memory only. The playhead lies on the timeline,
+/// far outside the 700x595 Media screenshot used by earlier versions.
+pub unsafe fn capture_editor(hwnd: HWND)->Result<Shot,String> {
+    capture_window(hwnd,true)
+}
+unsafe fn capture_window(hwnd: HWND,full:bool)->Result<Shot,String> {
     let mut rect:RECT=zeroed();
     if GetWindowRect(hwnd,&mut rect)==0 {return Err("Cannot read CapCut window bounds".into());}
     let width=rect.right-rect.left;
     let height=rect.bottom-rect.top;
     if width<700 || height<600 {return Err("CapCut window too small for media detection".into());}
-    let w=width.min(700);
-    let h=height.min(595);
+    let w=width.min(if full {3840}else{700});
+    let h=height.min(if full {2160}else{595});
     let screen=GetDC(null_mut());
     if screen.is_null() {return Err("GetDC failed".into());}
     let memory=CreateCompatibleDC(screen);
