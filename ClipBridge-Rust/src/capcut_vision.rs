@@ -148,9 +148,10 @@ pub fn find_imported_media(before:&Shot,after:&Shot)->Option<(MediaBox,f64)> {
         // A matching selection outline + a clear tile-content difference is
         // stronger evidence than the outline moving to a different slot.
         if changed_rect.overlaps(selected) && score>=8.0 {
-            // The cyan outline may extend beyond the real tile bounds.
-            // Always use the aligned thumbnail rectangle for the (+) hotspot.
-            return Some((changed_rect,score));
+            // Restore v0.7.4's verified hit rectangle. The selection outline
+            // matches the real Add (+) hotspot more closely than the estimated
+            // grid slot when CapCut has selected the freshly imported tile.
+            return Some((selected,score));
         }
     }
     // If no selection moved and the strongest changed tile is elsewhere,
