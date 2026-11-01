@@ -1,10 +1,10 @@
-# ClipBridge Rust v0.7.5 — Experimental CapCut Timeline Paste
+# ClipBridge Rust v0.7.6 — Experimental CapCut Timeline Paste
 
 Copy an image in Windows; ClipBridge saves its PNG in a bounded background worker.
 When the same image remains on Windows clipboard, pressing Ctrl+V in foreground
 CapCut attempts **Import into Media → Add to Track** automatically.
 
-## v0.7.5: Media deletion regression + 3-colour icon
+## v0.7.6: Media deletion regression + 3-colour icon
 
 - After a previously imported Media item is deleted, CapCut may reuse its
   exact thumbnail slot for the next import. The vision engine now accepts
@@ -16,7 +16,7 @@ CapCut attempts **Import into Media → Add to Track** automatically.
 - Retains the three persistent Settings toggles and the conditional
   single-paste gate from v0.7.3.
 
-## Copy-time PNG naming (v0.7.5)
+## Copy-time PNG naming (v0.7.6)
 
 When Ctrl+C copies a new image, ClipBridge immediately saves a NEW PNG file in
 the configured output folder with the name:
@@ -36,13 +36,27 @@ recent, read-only CapCut draft_meta_info.json, else `CapCutProject`.
 The explicit override field can be left blank for automatic detection.
 Neither CapCut's internal project title nor Media asset names are edited.
 
-## Second paste fix (v0.7.5)
+## v0.7.6 hotfix: restore functioning Add-to-Track
+
+v0.7.5 imported PNG files into Media but regressed timeline insertion.
+It introduced a synthetic `WM_MOUSEMOVE` before the '+' click,
+timed delays, and prioritized estimated grid geometry over the actual
+selected thumbnail outline. v0.7.6 **rolls back both changes** to the
+native v0.7.4 direct mouse-message click and selected-tile rectangle.
+The app still creates project-numbered/date-stamped PNG files at the
+moment of Ctrl+C and retains its settings and circular app icon.
+
+Actual timeline success requires testing in the user's CapCut app.
+No release build can verify a posted click was accepted by CapCut.
+
+## Second paste fix (v0.7.6)
 
 CapCut may append the next imported picture in a second thumbnail slot.
-The detector now uses the **actual grid slot** for the (+) hit target rather
-than a possibly offset cyan selection rectangle. The bridge sends one
-targeted synthetic hover message (no physical cursor movement), a short
-press, and a release, allowing Qt to expose/react to the second tile's (+).
+For a visibly selected new tile, the detector uses its cyan outline,
+preserving the working click target from v0.7.4. For a newly changed
+tile without a matching selection, it falls back to the grid slot only
+when visual evidence is strong. The bridge sends a direct down/up pair
+to the editor without synthetic hover, restoring first-paste behavior.
 Two-frame thumbnail stability checks from v0.7.4 remain. Real desktop
 regression verification is required: UI automation cannot promise that
 CapCut accepted the Add-to-Track command.
