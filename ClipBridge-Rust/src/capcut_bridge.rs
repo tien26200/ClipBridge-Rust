@@ -4,7 +4,8 @@
 //! Uses no physical cursor motion, no project file edits, no clipboard writes.
 //! Still uses an invisible Windows file chooser and synthetic window messages.
 //! This is NOT a public CapCut API and requires real-version testing.
-use crate::capcut_vision::{capture_media, find_imported_media, media_diagnostic, selected_media, needs_select_new_tile, MediaBox};
+use crate::capcut_vision::{capture_media, capture_editor, find_imported_media, media_diagnostic, selected_media, needs_select_new_tile, MediaBox};
+use crate::timeline_vision::{find_playhead,timeline_drop_target,DropTarget};
 use crate::media_reference::Reference;
 use std::{
     mem::{size_of,zeroed},
@@ -32,11 +33,15 @@ pub struct ImportJob {
     pub image: PathBuf,
     pub sequence: u32,
     pub reuse_media: bool,
+    pub at_playhead: bool,
 }
 pub struct ImportReport {
     pub box_: MediaBox,
     pub visual_change: f64,
     pub elapsed_ms: u128,
+    pub placement: &'static str,
+    pub playhead_x: Option<i32>,
+    pub timeline_visual_change: Option<f64>,
 }
 
 // One dedicated import worker serializes operations and owns these flags.
@@ -299,6 +304,83 @@ unsafe fn native_add_to_track(editor:HWND,b:MediaBox)
     Ok((client.x,client.y))
 }
 
+// Simulate Qt mouse drag strictly inside the editor HWND message queue;
+// never change the user's physical cursor, clipboard or saved CapCut draft.
+// Unlike the old plus-button code, the destination is derived from the
+// actual timeline playhead marker, not from a Media thumbnail position.
+// A failed playhead check must NOT silently fall back to '+' (wrong time).
+unsafe fn native_drag_to_playhead(
+    editor:HWND,source:MediaBox,target:DropTarget
+)->Result<(),String>{
+    let rect=bounds(editor);
+    let src=POINT{
+        x:rect.left+source.left+24,
+        y:rect.top+(source.top+source.bottom)/2,
+    };
+    let dst=POINT {
+        x:rect.left+target.x,
+        y:rect.top+target.y,
+    };
+    let mut from=src;
+    let mut to=dst;
+    if ScreenToClient(editor,&mut from)==0 ||
+       ScreenToClient(editor,&mut to)==0 {
+        return Err("Cannot map Media or playhead into editor window".into());
+    }
+    if (to.y-from.y).abs()<100 || to.x<145 {
+        return Err("Playhead drop target outside a valid timeline region".into());
+    }
+    let start=packed_point(from);
+    if PostMessageW(editor,WM_LBUTTONDOWN,MK_LBUTTON as usize,start)==0 {
+        return Err("Cannot press Media image for playhead placement".into());
+    }
+    // One local move passes the minimum Qt drag threshold while remaining
+    // on the correct media image; subsequent moves follow a single smooth
+    // bounded path to the playhead. Synthetic events do not move real cursor.
+    let mut path_ok=true;
+    for step in 1..=18i32{
+        let px=from.x+(to.x-from.x)*step/18;
+        let py=from.y+(to.y-from.y)*step/18;
+        let point=POINT{x:px,y:py};
+        if PostMessageW(editor,WM_MOUSEMOVE,MK_LBUTTON as usize,
+            packed_point(point))==0 {
+            path_ok=false;
+            break;
+        }
+        thread::sleep(Duration::from_millis(11));
+    }
+    // Always release even when an intermediate message was rejected, so
+    // the target editor does not remain in a synthetic pressed state.
+    let released=PostMessageW(editor,WM_LBUTTONUP,0,
+        packed_point(if path_ok{to}else{from}))!=0;
+    if !path_ok || !released {
+        return Err("CapCut window rejected drag path or mouse release".into());
+    }
+    Ok(())
+}
+fn timeline_patch_difference(
+    before:&crate::capcut_vision::Shot,
+    after:&crate::capcut_vision::Shot,
+    x:i32,y:i32,
+)->f64{
+    if before.width()!=after.width()||before.height()!=after.height(){
+        return 0.0;
+    }
+    let mut change=0u64;
+    let mut count=0u64;
+    for yy in ((y-22).max(0)..(y+23).min(before.height() as i32)).step_by(4){
+        for xx in ((x+8).max(0)..(x+100).min(before.width() as i32)).step_by(4){
+            let a=before.pixel(xx as usize,yy as usize);
+            let b=after.pixel(xx as usize,yy as usize);
+            change+=a.0.abs_diff(b.0) as u64+
+                a.1.abs_diff(b.1) as u64+
+                a.2.abs_diff(b.2) as u64;
+            count+=3;
+        }
+    }
+    change as f64 / count.max(1) as f64
+}
+
 /// Runs only on a dedicated worker, never inside the Windows keyboard hook.
 /// Ok means the add command was SENT, not proof that a clip was inserted.
 pub unsafe fn import_then_add(
@@ -313,6 +395,18 @@ pub unsafe fn import_then_add(
     if GetClipboardSequenceNumber()!=job.sequence {
         return Err("Clipboard changed before import; refusing to add a stale image".into());
     }
+    // Preflight the real playhead BEFORE importing. If CapCut's layout
+    // lacks an identifiable marker, fail before changing Media.
+    let original_playhead=if job.at_playhead{
+        let full=capture_editor(editor)?;
+        let playhead=find_playhead(&full)
+            .ok_or("Cannot identify CapCut playhead; no Media import or timeline action performed")?;
+        let drop=timeline_drop_target(&full,playhead)
+            .ok_or("Cannot find a safe empty video track at playhead; no import performed")?;
+        trace(&format!("PLAYHEAD_PRECHECK x={} y={} marker_score={}",
+            playhead.x,drop.y,playhead.score));
+        Some(playhead.x)
+    }else{None};
     // Wait until the user's physical Ctrl+V is released before Ctrl+I.
     let deadline=Instant::now()+Duration::from_millis(800);
     while Instant::now()<deadline &&
@@ -465,7 +559,37 @@ pub unsafe fn import_then_add(
     } else {
         trace("MEDIA_SELECTION_MATCHED target=new_import");
     }
-    let (x,y)=native_add_to_track(editor,target)?;
-    trace(&format!("ADD_TO_TRACK_SENT target=editor client_x={x} client_y={y} result_not_verified"));
-    Ok(ImportReport{box_:target,visual_change:score,elapsed_ms:started.elapsed().as_millis()})
+    let (placement,playhead_x,visual_change)=if job.at_playhead{
+        let before_drag=capture_editor(editor)?;
+        let playhead=find_playhead(&before_drag)
+            .ok_or("CapCut playhead disappeared during Media import; refused to place clip")?;
+        let saved=original_playhead.ok_or("Playhead precheck missing")?;
+        if (playhead.x-saved).abs()>4 {
+            return Err("CapCut playhead moved during import; refused to place at wrong time".into());
+        }
+        let target_drop=timeline_drop_target(&before_drag,playhead)
+            .ok_or("Timeline target is occupied or unclear; no drag or Add (+) sent")?;
+        trace(&format!("PLAYHEAD_DRAG_STARTED source=({},{}..{},{}),drop_x={},drop_y={}",
+            target.left,target.top,target.right,target.bottom,target_drop.x,target_drop.y));
+        native_drag_to_playhead(editor,target,target_drop)?;
+        thread::sleep(Duration::from_millis(160));
+        let after_drag=capture_editor(editor)?;
+        let visual=timeline_patch_difference(
+            &before_drag,&after_drag,target_drop.x,target_drop.y
+        );
+        trace(&format!("PLAYHEAD_DRAG_SENT x={} y={} timeline_patch_change={visual:.1} result_not_verified",
+            target_drop.x,target_drop.y));
+        if visual<4.5 {
+            trace("PLAYHEAD_DRAG_NO_VISIBLE_TIMELINE_CHANGE posted_not_confirmed");
+        }
+        ("playhead_drag",Some(playhead.x),Some(visual))
+    }else{
+        let (x,y)=native_add_to_track(editor,target)?;
+        trace(&format!("ADD_TO_TRACK_SENT target=editor client_x={x} client_y={y} result_not_verified"));
+        ("legacy_plus",None,None)
+    };
+    Ok(ImportReport{
+        box_:target,visual_change:score,elapsed_ms:started.elapsed().as_millis(),
+        placement,playhead_x,timeline_visual_change:visual_change,
+    })
 }
