@@ -20,6 +20,7 @@ pub struct Reference {
 #[derive(Clone,Copy,Debug)]
 pub struct MatchingTile {
     pub rect:MediaBox,
+    pub slot:MediaBox,
     pub loss:f64,
     pub runner_up_loss:f64,
     pub change_score:f64,
@@ -113,13 +114,13 @@ impl Reference {
     /// - a plausible colour-histogram match;
     /// - no equally good second tile;
     /// - a visible change OR source-consistent selected-card evidence.
-    pub fn locate(&self,before:&Shot,after:&Shot)->Option<MatchingTile>{
+    pub fn locate(&self,before:Option<&Shot>,after:&Shot)->Option<MatchingTile>{
         let slots=media_slots(after);
         let mut candidates:Vec<(f64,MediaBox,f64)>=slots.into_iter()
             .map(|box_|{
                 let hist=self.tile_histogram(after,box_);
                 let l=loss(&hist,&self.bins);
-                let change=box_score(before,after,box_);
+                let change=before.map(|old|box_score(old,after,box_)).unwrap_or(0.0);
                 (l,box_,change)
             }).collect();
         candidates.sort_by(|a,b|a.0.total_cmp(&b.0));
@@ -128,10 +129,14 @@ impl Reference {
         // 0 means an exact visual match, 6 the maximum colour disagreement.
         // Similar-looking media should fail rather than click the wrong card.
         if best>1.25 || second-best<0.36 {return None;}
-        if changed<3.5 {return None;}
+        // In reuse mode B was already imported on the prior attempt, so a
+        // before/after pixel difference is not expected. Confidence must
+        // then come from the source's distinct visual match, not UI motion.
+        if before.is_some() && changed<3.5 {return None;}
         let chosen=selected_geometry_for_slot(slot,after);
         Some(MatchingTile{
             rect:chosen,
+            slot,
             loss:best,
             runner_up_loss:second,
             change_score:changed,
@@ -167,16 +172,26 @@ mod tests {
         let path=png_for_test();
         let reference=Reference::from_png(&path).unwrap();
         let (before,after,new)=synthetic();
-        let located=reference.locate(&before,&after).expect("blue source is new Media tile");
+        let located=reference.locate(Some(&before),&after).expect("blue source is new Media tile");
         assert_eq!(located.rect,new);
         assert!(located.change_score>10.0);
+        fs::remove_file(path).unwrap();
+    }
+    #[test] fn reuse_existing_source_does_not_require_new_import_diff(){
+        let path=png_for_test();
+        let reference=Reference::from_png(&path).unwrap();
+        let (_,after,slot)=synthetic();
+        let found=reference.locate(None,&after)
+            .expect("a previously imported picture should be found without reimport");
+        assert_eq!(found.slot,slot);
+        assert!(found.loss<0.1,"source image should match target thumbnail");
         fs::remove_file(path).unwrap();
     }
     #[test] fn unchanged_screen_does_not_claim_new_import(){
         let path=png_for_test();
         let reference=Reference::from_png(&path).unwrap();
         let (_,shot,_)=synthetic();
-        assert!(reference.locate(&shot,&shot).is_none());
+        assert!(reference.locate(Some(&shot),&shot).is_none());
         fs::remove_file(path).unwrap();
     }
 }
