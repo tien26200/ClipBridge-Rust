@@ -399,6 +399,9 @@ pub unsafe fn import_then_add(
         // Only bounding boxes, scores and selection coordinates; never
         // export the user's images or screenshots to log files.
         trace(&format!("MEDIA_DIAGNOSTIC {}",media_diagnostic(&before,after)));
+        if let Some(ref fingerprint)=source {
+            trace(&format!("MEDIA_SOURCE_DIAGNOSTIC {}",fingerprint.diagnostic(after)));
+        }
     }
     let (box_,slot,score)=found.ok_or(
         "Exact/new Media item not confidently identified; no Add command sent (see MEDIA_DIAGNOSTIC)"
