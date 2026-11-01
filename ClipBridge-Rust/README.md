@@ -1,23 +1,57 @@
-# ClipBridge Rust v0.6.0
+# ClipBridge Rust v0.7.0 — Experimental CapCut Timeline Paste
 
-Lightweight Windows clipboard PNG auto-save utility with a **passive**, experimental CapCut timeline bridge foundation.
+Copy an image in Windows; ClipBridge saves its PNG in a bounded background worker.
+When the same image remains on Windows clipboard, pressing Ctrl+V in foreground
+CapCut attempts **Import into Media → Add to Track** automatically.
 
-## Current behavior
-- Watches Windows clipboard image changes (PNG, DIBV5, DIB), writes PNG asynchronously.
-- Deduplicates images by content hash and retains source clipboard on auto-save.
-- Background tray application, configurable image folder, manual copy-path button.
-- Rotating asynchronous diagnostic log: `%LOCALAPPDATA%\\ClipBridge\\clipbridge.log`.
-- Observes Ctrl+V when CapCut is foreground, without consuming the keystroke or moving mouse.
-- Adds `src/timeline_bridge.rs` interface for future CapCut-version-specific integration.
+## CapCut action bridge (experimental)
+- The keyboard observer never blocks Ctrl+V and never changes clipboard.
+- A dedicated single-job import worker waits for Ctrl+V to be released.
+- Sends Ctrl+I only in foreground CapCut/Jianying and hides the Windows File Open dialog.
+- Sends the exact saved PNG path to the native dialog.
+- Uses a bounded GDI screenshot of the Media panel before and after import.
+- Requires visual evidence of a new media tile and sends native window messages
+  to its Add (+) hotspot; the physical mouse pointer does not move.
+- Does not change window dimensions, alter project draft files or install plugins.
+- Does **not** create a native CapCut API: this is best-effort UI automation.
 
-## Not yet implemented
-**Ctrl+V does NOT insert external images directly into the CapCut timeline.** The built-in adapter deliberately returns `Unsupported`. User testing showed CapCut did not accept Explorer PNG clipboard paste into the timeline, although manual drag-and-drop into Media worked. No verified native timeline insertion interface is available for this CapCut version. This release does not invoke Import, modify project drafts, inject code into CapCut, or simulate mouse dragging.
+**Important:** Verified compilation alone does not prove it works with a given
+CapCut version, theme, scaling, Media layout or input-message behavior. The
+`IMPORT_ADD_COMMAND_SENT` event means only that the click message was posted.
+An actual timeline insertion must be confirmed on the user's CapCut desktop.
+Other Ctrl+V operations pass through when no matching fresh image is on clipboard.
 
-## Windows build
-GitHub Actions: `.github/workflows/windows-build.yml`. Download the latest successful artifact `ClipBridge-Rust-v0.6.0-Windows-x64`, containing `ClipBridge.exe`, `SHA256.txt`, and `TESTING.md`. Extract once. The executable is not code-signed. Scan it with Windows Defender before running.
+## Test steps
+1. Exit older ClipBridge instances. Run the new EXE and keep the experimental
+   checkbox enabled.
+2. Open a disposable CapCut project with the Media panel showing.
+3. Check that Ctrl+I opens the normal Windows file picker when performed manually.
+4. Copy an image from a browser or screenshot tool.
+5. Switch to CapCut and press Ctrl+V once; keep CapCut foreground through import.
+6. Confirm image in Media and on the timeline near the current playhead.
+7. If unsuccessful, open `%LOCALAPPDATA%\\ClipBridge\\clipbridge.log`.
+   Share the IMPORT_STEP / IMPORT_FAILED lines; no screenshot is written.
+8. Turn off experimental Auto Add if the workflow misbehaves.
 
-## Logs / troubleshooting
-Start ClipBridge, copy a PNG/DIB image, then check `SAVE_OK` in the log. Ctrl+V in focused CapCut should emit `CAPCUT_PASTE_OBSERVED result=Unsupported` if the hook is installed. No keys should be blocked and no windows should open automatically. Do not confuse this log event with successful timeline insertion.
+## Performance and privacy
+- PNG auto-save reuses raw PNG when possible and encodes DIB with fast compression.
+- Latest image registry avoids directory scanning and re-encoding on paste.
+- A single worker serializes imports and prevents rapid duplicate requests.
+- The GDI screenshot includes only a small region of the CapCut Media pane,
+  is used in memory, and is not saved or transmitted.
+- The log uses a bounded async channel and rotates near 2 MiB.
+- The binary is unsigned; scan with Windows Defender before execution.
 
-## Next integration step
-A supported or verified CapCut timeline adapter is required for inserting PNG at the playhead without modifying the mouse or workspace layout. Verify the exact CapCut Desktop version and its accessible integration points before enabling this feature.
+## Prior art
+The user-interface automation approach was adapted to Rust after reviewing the
+MIT-licensed **Jiandan** project for Jianying:
+https://github.com/SKYCHENV/Jiandan .
+Jiandan is an independent third-party project and is not affiliated with ClipBridge.
+
+## Build
+`cargo test` and `cargo build --release --target x86_64-pc-windows-msvc`
+are run by GitHub Actions in `.github/workflows/windows-build.yml`.
+The artifact ZIP contains `ClipBridge.exe`, `SHA256.txt`, and `TESTING.md`.
+
+If import reports failure, do not assume CapCut supports the same UI control
+structure as Jianying; adapt only after reviewing the actual desktop behavior.
