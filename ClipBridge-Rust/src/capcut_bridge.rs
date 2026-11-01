@@ -5,6 +5,7 @@
 //! Still uses an invisible Windows file chooser and synthetic window messages.
 //! This is NOT a public CapCut API and requires real-version testing.
 use crate::capcut_vision::{capture_media, find_imported_media, media_diagnostic, selected_media, needs_select_new_tile, MediaBox};
+use crate::media_reference::Reference;
 use std::{
     mem::{size_of,zeroed},
     os::windows::ffi::OsStrExt,
@@ -323,6 +324,10 @@ pub unsafe fn import_then_add(
     }
     let before=capture_media(editor)?;
     trace("MEDIA_BEFORE_CAPTURED");
+    // Decoding only a sparse source histogram avoids screenshots on disk and
+    // independently identifies B when CapCut still highlights A.
+    let source=Reference::from_png(&job.image).ok();
+    trace(if source.is_some(){"SOURCE_FINGERPRINT_READY"}else{"SOURCE_FINGERPRINT_UNAVAILABLE using_visual_only"});
     open_image(editor,job.pid,&job.image,&mut trace)?;
     trace("MEDIA_IMPORT_REQUEST_FINISHED");
     let mut found=None;
@@ -334,7 +339,17 @@ pub unsafe fn import_then_add(
         if !window_is_editor(editor,job.pid) {break;}
         let after=capture_media(editor)?;
         check_count+=1;
-        if let Some((b,score))=find_imported_media(&before,&after) {
+        let by_source=source.as_ref().and_then(|s|s.locate(&before,&after));
+        let chosen=if let Some(m)=by_source {
+            Some((m.rect,m.change_score))
+        } else {
+            // Never auto-click a barely changed selected border (the 5.4
+            // score in the user's failed seq579 retry): it may be the old
+            // Media item reselected while the actual B is elsewhere.
+            find_imported_media(&before,&after)
+                .filter(|(_,score)|*score>=12.0)
+        };
+        if let Some((b,score))=chosen {
             // Two agreeing observations distinguish the actual new image
             // from CapCut's first-frame selection/thumbnail redraw.
             if let Some((prev,_))=candidate {
@@ -357,6 +372,7 @@ pub unsafe fn import_then_add(
         thread::sleep(Duration::from_millis(130));
     }
     trace(&format!("MEDIA_CHECKS count={check_count}"));
+    trace(&format!("SOURCE_MATCHER enabled={} fallback_min_change=12.0",source.is_some()));
     if let Some(ref after)=last_media {
         // Only bounding boxes, scores and selection coordinates; never
         // export the user's images or screenshots to log files.
