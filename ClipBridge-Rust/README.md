@@ -1,8 +1,19 @@
-# ClipBridge Rust v0.7.2 — Experimental CapCut Timeline Paste
+# ClipBridge Rust v0.7.3 — Experimental CapCut Timeline Paste
 
 Copy an image in Windows; ClipBridge saves its PNG in a bounded background worker.
 When the same image remains on Windows clipboard, pressing Ctrl+V in foreground
 CapCut attempts **Import into Media → Add to Track** automatically.
+
+## Settings: three independent checkboxes
+
+Open the ClipBridge window from its tray icon, and tick any combination:
+
+- **Tự thêm ảnh vào CapCut**: Auto Add (ON by default).
+- **Chặn Ctrl+V gốc**: block CapCut's native paste of previously copied media when ClipBridge receives an external image (ON by default, recommended).
+- **Clear clipboard Windows**: clear the current clipboard after the new image's Add-to-Track command has been sent (OFF by default). This also removes that copied image from Windows Clipboard, but keeps PNG files intact. It is not a substitute for native paste blocking.
+
+These settings survive restart in `%LOCALAPPDATA%\\ClipBridge\\preferences.ini`.
+Both block and clear may be ticked together. If block is disabled, native CapCut Ctrl+V may still create an old timeline clip, even if clear is enabled.
 
 ## CapCut action bridge (experimental)
 - **Fix double paste:** CapCut's native Ctrl+V was previously passed through while
