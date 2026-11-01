@@ -1,46 +1,45 @@
-# ClipBridge Rust v0.7.2 — fix duplicated old image when pasting
+# ClipBridge Rust v0.7.3 — selectable Ctrl+V blocking and clipboard clearing
 
-## Regression observed in v0.7.1
+## Settings (ClipBridge tray icon → Mở ClipBridge)
 
-Pressing Ctrl+V with a newly copied image sometimes created two clips: first a
-previous CapCut Media item, then the current image. Source-level root cause:
-the keyboard hook always called CallNextHookEx for Ctrl+V while concurrently
-sending ClipBridge's Import -> Add-to-Track request.
+- **Tự thêm ảnh vào CapCut khi Ctrl+V**: Auto Add, enabled by default.
+- **Chặn Ctrl+V gốc khi thêm ảnh mới**: enabled by default. Only
+  intercepts the V key for the exact current captured clipboard image
+  while CapCut foreground. It avoids CapCut pasting previously copied media.
+- **Clear clipboard Windows sau khi gửi lệnh thêm ảnh**: disabled by default.
+  Optional cleanup after the successful Add-to-Track command. It clears
+  Windows clipboard only if sequence still matches the image being imported.
+  If another image/text is copied in the meantime, it does NOT clear it.
+  This option does NOT remove old media, previous copied project state or PNG files.
 
-## Fix v0.7.2
+All three toggles persist in `%LOCALAPPDATA%\ClipBridge\preferences.ini`.
+All options can be toggled independently. Both protections can be selected
+at the same time; native Ctrl+V blocking still owns the anti-duplicate path.
+When blocking is OFF, CapCut's normal Ctrl+V can still paste an old media
+clip in addition to ClipBridge's imported image — clearing afterward does
+not prevent that. Keep blocking enabled for the normal workflow.
 
-1. Intercept the physical V-down only when Ctrl is held, CapCut/Jianying is
-   foreground, Auto Add is enabled, and Windows clipboard sequence equals
-   ClipBridge's last captured image sequence.
-2. Queue a single ClipBridge paste request and return nonzero from the hook,
-   preventing CapCut's own Ctrl+V from inserting a stale internal item.
-3. Suppress the matching V-up and autorepeat; do not globally block the keyboard.
-4. Copy/Paste with text or with CapCut Media internal objects remains untouched.
-5. Capture and route an image even while the PNG save worker is finishing; once
-   saved, import the exact sequence that was requested.
-6. If the clipboard changes before or during import, refuse to add the stale
-   file to timeline. No clipboard writes and no project draft edits.
-7. The v0.7.1 Media tile + button targeting and reduced focus jitter remain.
+## Quick regression checklist
+1. Exit older ClipBridge fully and launch v0.7.3.
+2. Open Settings and verify defaults: Auto Add ON, Block Native ON, Clear OFF.
+3. Copy image from browser, Ctrl+V in CapCut. Only the new image should
+   be added (not previously copied CapCut media).
+4. Enable Clear, copy a NEW image, Ctrl+V once. Check timeline and
+   clipboard emptiness after the Add-to-Track message is sent.
+5. Turn Clear OFF, copy a NEW image, Ctrl+V. Image should remain in
+   Windows Clipboard after import.
+6. Switch Block OFF and copy a NEW image, Ctrl+V. ClipBridge should still
+   import the image, but CapCut may also paste an old media clip.
+7. Copy text and paste into Notepad; verify normal behavior.
+8. Copy an existing media tile within CapCut then Ctrl+V; its native
+   copy/paste must still work.
+9. Restart ClipBridge and verify settings have persisted.
+10. For errors send `%LOCALAPPDATA%\ClipBridge\clipbridge.log` events:
+    `CAPCUT_PASTE_ROUTED`, `IMPORT_STARTED`,
+    `IMPORT_ADD_COMMAND_SENT`, `CLIPBOARD_CLEARED`.
 
-## Test checklist
-
-- Close previous ClipBridge, launch v0.7.2; use a disposable CapCut project.
-- Copy media tile A inside CapCut, place one instance manually on timeline.
-- Copy NEW image B from the browser, then Ctrl+V in CapCut once:
-  **only B** should be imported and added, with no additional A.
-- Repeat with another image C; verify that B is not inserted again.
-- In CapCut, select a Media item and manually Ctrl+C then Ctrl+V:
-  internal CapCut paste should still work.
-- Copy text and paste it into Notepad and other apps; verify normal behavior.
-- Try holding Ctrl+V to verify a single import per V press.
-- Check `%LOCALAPPDATA%\ClipBridge\clipbridge.log` for
-  `CAPCUT_CTRL_V_SUPPRESSED`, `IMPORT_STARTED`, `IMPORT_ADD_COMMAND_SENT`,
-  or `IMPORT_FAILED`.
-- If pressing Ctrl+V produces no clip, verify Auto Add is enabled, the image
-  was captured, and the clipboard did not change.
-
-Release build and tests do **not** establish that native CapCut inserted a clip:
-`IMPORT_ADD_COMMAND_SENT` means only that an input message was posted.
-Real desktop regression test is required before calling the bug resolved.
-
-The EXE is unsigned; scan it with Microsoft Defender before use.
+## Notes
+- The copied PNG files are never removed: CapCut projects may reference them.
+- Clear executes AFTER an Add-to-Track message has been sent, not after a
+  verified timeline insertion. Real CapCut visual confirmation is still required.
+- The EXE is unsigned. Test on a disposable CapCut project.
