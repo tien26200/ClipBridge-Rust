@@ -1,41 +1,48 @@
-# ClipBridge Rust v0.7.6 — urgent timeline insertion regression fix
+# ClipBridge Rust v0.7.7 — second image to timeline
 
-v0.7.5 was reported to add NONE of the images to the timeline (Media only).
-Reviewing the precise source change revealed two experimental differences
-from the earlier 0.7.4 build which had inserted some images successfully:
-1. A new `WM_MOUSEMOVE` hover plus timing delays before Add (+) click.
-2. The inferred grid bounding box replacing CapCut's selection outline,
-   changing the click coordinate for the first/selected image.
+## Observed on the user's CapCut
+v0.7.6: first image may import into Media and reach timeline, but the
+second copied picture enters Media without being added to timeline.
 
-## Fix
-- Remove the synthetic hover and return to v0.7.4's direct
-  `WM_LBUTTONDOWN` + `WM_LBUTTONUP` pair on the top-level editor HWND.
-- Restore the selected Media thumbnail rectangle as click geometry when
-  it overlaps the freshly changed tile; retain conservative second-tile
-  detection fallback and two-observation stability check.
-- Keep v0.7.5's feature: save the original PNG immediately at Ctrl+C
-  as `TênProject_001_DD-MM-YYYY.png`, sequential per project and day.
-  Existing files are never renamed or overwritten; CapCut Media names are
-  not directly modified.
-- Keep Settings checkboxes (Auto Add, Block Native, Clear Clipboard).
-- Keep circular three-colour Windows app icon.
+## Source-level failure mode addressed
+The v0.7.6 Media detector treated a selected cyan outline as the target,
+but CapCut can keep the outline on A after importing B. Its fallback
+required difference score >=22 before trying new slot B; many legitimate
+thumbnails change the pixels by less. Also Add (+) may not accept messages
+for an unselected new tile. These are code-path explanations, not a
+verified diagnosis of the user's specific CapCut version without its log.
 
-## User regression steps
-1. Exit every old ClipBridge instance; launch 0.7.6.
-2. In a test CapCut project, copy A from browser and Ctrl+V in editor.
-   Confirm A appears in BOTH Media and timeline.
-3. Copy B from browser and Ctrl+V again. Confirm B appears in timeline.
-4. Remove older Media clip A, copy C, and Ctrl+V; confirm timeline.
-5. Verify output folder has consecutive project-numbered date PNGs
-   created at time of copying images, not after pasting.
-6. If no clip is added, send the log:
+## Change
+1. Rank thumbnail cell changes in memory and require concentration in a
+   unique changed slot; permit score >=7 for an otherwise stable UI.
+2. If the old selected rectangle A does not overlap new changed slot B,
+   derive B's click geometry from A's known selection outline, preserving
+   the right/bottom hotspot offsets of the working first import.
+3. In that case only, click the CENTER of B by top-level window messages,
+   wait up to 720ms for the cyan selection to switch to B, then send the
+   standard, unmodified (+) Add-to-Track message pair exactly once.
+4. Log Media candidates, selection changes and click coordinates, never
+   image pixels; stop if the new selection cannot be confirmed.
+5. Keep clipboard conditional paste blocking, optional clear, project/
+   STT/date PNG filenames at the moment of copy, and circular app icon.
+
+## Required CapCut regression check
+1. Exit the old ClipBridge from tray; run v0.7.7 in a disposable project.
+2. Copy image A from browser. Ctrl+V in CapCut. Check Media AND timeline.
+3. Copy image B from browser. Ctrl+V once. Check timeline. Do NOT delete A.
+4. Copy image C. Ctrl+V. Check timeline.
+5. Delete a Media thumbnail, then copy/paste D. Check timeline.
+6. Verify PNG filenames retain project/001/002/003 and local date.
+7. If B stays Media-only, send the tail of:
    `%LOCALAPPDATA%\ClipBridge\clipbridge.log`.
-   Log lines: MEDIA_TILE_FOUND, MEDIA_TILE_STABLE,
-   ADD_TO_TRACK_SENT, IMPORT_FAILED, IMPORT_ADD_COMMAND_SENT.
+   Useful events:
+   `MEDIA_DIAGNOSTIC`, `MEDIA_SELECTION_STALE`,
+   `MEDIA_SELECT_CONFIRMED`, `MEDIA_SELECT_NOT_CONFIRMED`,
+   `MEDIA_TILE_FOUND`, `ADD_TO_TRACK_SENT`, `IMPORT_FAILED`.
+8. Run manual Ctrl+C → Ctrl+V within CapCut to confirm native paste still works.
 
-## Limitations
-- A successful Rust test/build verifies implementation/packaging only,
-  NOT successful CapCut insertion on the user's version.
-- This reverts the regressions but does not prove every second-tile layout
-  is handled. If B still stays in Media, exact log/CapCut layout needed.
-- EXE unsigned; scan with Microsoft Defender.
+## Cautions
+Unit tests and Windows Release build validate code and packaging, but do NOT
+confirm CapCut actually accepted a message or inserted a timeline clip.
+No screenshots/pixel data are written to disk.
+The EXE is unsigned; scan with Windows Defender.
