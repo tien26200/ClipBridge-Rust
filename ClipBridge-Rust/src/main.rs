@@ -37,6 +37,8 @@ const STATUS: isize = 108;
 const SHOW: isize = 109;
 const LOG: isize = 110;
 const AUTO_ADD: isize = 112;
+const BLOCK_NATIVE: isize = 113;
+const CLEAR_AFTER: isize = 114;
 const WM_IMPORT_FINISHED: u32 = WM_APP + 4;
 const LOG_LIMIT: u64 = 2 * 1024 * 1024;
 struct Job {
@@ -55,6 +57,9 @@ struct ImportComplete {
 struct App {
     folder: PathBuf,
     config: PathBuf,
+    preferences: PathBuf,
+    block_native: bool,
+    clear_after_import: bool,
     latest: Option<PathBuf>,
     latest_sequence: Option<u32>,
     tx: SyncSender<Job>,
@@ -80,6 +85,8 @@ struct App {
     import_worker: Option<std::thread::JoinHandle<()>>,
     import_busy: bool,
     import_enabled: bool,
+    block_checkbox: HWND,
+    clear_checkbox: HWND,
     pending_import: Option<(u32, usize, u32)>,
     last_import_attempt: Option<Instant>,
 }
@@ -92,6 +99,68 @@ fn logger_path() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("ClipBridge")
         .join("clipbridge.log")
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct PastePreferences {
+    auto_add: bool,
+    block_native: bool,
+    clear_after_import: bool,
+}
+impl Default for PastePreferences {
+    fn default()->Self {
+        Self {auto_add:true,block_native:true,clear_after_import:false}
+    }
+}
+fn prefs_path()->PathBuf {
+    logger_path().with_file_name("preferences.ini")
+}
+fn parse_preferences(text:&str)->PastePreferences {
+    let mut p=PastePreferences::default();
+    for line in text.lines(){
+        let Some((key,value))=line.split_once('=') else {continue;};
+        let val=match value.trim(){"true"|"1"=>true,"false"|"0"=>false,_=>continue};
+        match key.trim(){
+            "auto_add"=>p.auto_add=val,
+            "block_native"=>p.block_native=val,
+            "clear_after_import"=>p.clear_after_import=val,
+            _=>{}
+        }
+    }
+    p
+}
+fn load_preferences(path:&Path)->PastePreferences {
+    fs::read_to_string(path).ok().map(|s|parse_preferences(&s))
+        .unwrap_or_default()
+}
+fn save_preferences(a:&App)->Result<(),String>{
+    if let Some(dir)=a.preferences.parent(){
+        fs::create_dir_all(dir).map_err(|e|e.to_string())?;
+    }
+    fs::write(&a.preferences,format!(
+        "auto_add={}\nblock_native={}\nclear_after_import={}\n",
+        a.import_enabled,a.block_native,a.clear_after_import
+    )).map_err(|e|e.to_string())
+}
+#[cfg(test)]
+mod preferences_tests {
+    use super::{PastePreferences,parse_preferences,is_image_paste_eligible};
+    #[test] fn defaults_protect_from_stale_capcut_copy() {
+        assert_eq!(parse_preferences(""),PastePreferences {
+            auto_add:true,block_native:true,clear_after_import:false
+        });
+    }
+    #[test] fn settings_can_be_independently_ticked() {
+        assert_eq!(parse_preferences("block_native=false\nclear_after_import=true\n"),
+            PastePreferences{auto_add:true,block_native:false,clear_after_import:true});
+        assert_eq!(parse_preferences("auto_add=false\nblock_native=true\nclear_after_import=true\n"),
+            PastePreferences{auto_add:false,block_native:true,clear_after_import:true});
+        assert!(is_image_paste_eligible(true,42,42));
+    }
+    #[test] fn unrecognized_values_do_not_disable_protection(){
+        assert!(parse_preferences("block_native=hello").block_native);
+        assert!(!parse_preferences("clear_after_import=maybe").clear_after_import);
+    }
 }
 fn start_logger(path: PathBuf) -> (SyncSender<String>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::sync_channel::<String>(256);
@@ -338,6 +407,8 @@ unsafe fn capture(app: &mut App) {
 static PASTE_TARGET: AtomicIsize = AtomicIsize::new(0);
 static PASTE_IMAGE_SEQ: AtomicU32 = AtomicU32::new(0);
 static PASTE_AUTOMATION: AtomicBool = AtomicBool::new(false);
+static PASTE_BLOCK_NATIVE: AtomicBool = AtomicBool::new(true);
+static PASTE_V_ROUTED: AtomicBool = AtomicBool::new(false);
 static PASTE_V_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 const WM_PASTE_OBSERVED: u32 = WM_APP + 3;
 
@@ -379,12 +450,15 @@ unsafe extern "system" fn paste_observer(code: i32, w: WPARAM, l: LPARAM) -> LRE
     let key_down=w as u32==WM_KEYDOWN || w as u32==WM_SYSKEYDOWN;
     let key_up=w as u32==WM_KEYUP || w as u32==WM_SYSKEYUP;
     if key_up {
+        PASTE_V_ROUTED.store(false,Ordering::Relaxed);
         if PASTE_V_SUPPRESSED.swap(false,Ordering::Relaxed) {return 1;}
         return CallNextHookEx(null_mut(),code,w,l);
     }
-    if key_down && PASTE_V_SUPPRESSED.load(Ordering::Relaxed) {
-        // Ignore key repeat for a single physical V press.
-        return 1;
+    if key_down && PASTE_V_ROUTED.load(Ordering::Relaxed){
+        // One ClipBridge request per physical V press. If native blocking is
+        // selected, suppress repeats too. Otherwise allow regular key flow.
+        if PASTE_V_SUPPRESSED.load(Ordering::Relaxed){return 1;}
+        return CallNextHookEx(null_mut(),code,w,l);
     }
     if key_down &&
         (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000)!=0 {
@@ -394,11 +468,15 @@ unsafe extern "system" fn paste_observer(code: i32, w: WPARAM, l: LPARAM) -> LRE
             PASTE_IMAGE_SEQ.load(Ordering::Relaxed),seq) {
             if focused_capcut().is_some() {
                 let target=PASTE_TARGET.load(Ordering::Relaxed) as HWND;
-                // Only swallow the original keyboard event after it is queued.
+                // Always route the new image to ClipBridge. Whether CapCut's
+                // own Ctrl+V also runs is controlled by a separate checkbox.
                 if !target.is_null() &&
                     PostMessageW(target,WM_PASTE_OBSERVED,seq as usize,0)!=0 {
-                    PASTE_V_SUPPRESSED.store(true,Ordering::Relaxed);
-                    return 1;
+                    PASTE_V_ROUTED.store(true,Ordering::Relaxed);
+                    if PASTE_BLOCK_NATIVE.load(Ordering::Relaxed){
+                        PASTE_V_SUPPRESSED.store(true,Ordering::Relaxed);
+                        return 1;
+                    }
                 }
             }
         }
@@ -453,6 +531,29 @@ unsafe fn enqueue_import(a:&mut App,editor:usize,pid:u32,sequence:u32,path:PathB
     }
 }
 
+// Deliberately optional: clearing Windows clipboard is cleanup AFTER an
+// import command, not a substitute for suppressing CapCut's native paste.
+// Do not remove the PNG file: CapCut may reference it in this project.
+unsafe fn clear_clipboard_if_unchanged(a:&mut App,seq:u32)->Result<bool,String>{
+    if GetClipboardSequenceNumber()!=seq {return Ok(false);}
+    if OpenClipboard(a.main)==0 {
+        return Err("Cannot open clipboard for optional cleanup".into());
+    }
+    let result=if GetClipboardSequenceNumber()!=seq {
+        Ok(false)
+    } else if EmptyClipboard()==0 {
+        Err("Windows refused EmptyClipboard".to_string())
+    } else {
+        a.last_seq=GetClipboardSequenceNumber();
+        a.latest_sequence=None;
+        a.pending_import=None;
+        a.latest=None; // clears only in-memory latest; PNG files remain.
+        PASTE_IMAGE_SEQ.store(0,Ordering::Relaxed);
+        Ok(true)
+    };
+    CloseClipboard();
+    result
+}
 unsafe fn choose_folder(hwnd: HWND) -> Option<PathBuf> {
     let mut display = [0u16; 260];
     let title = wide("Chọn thư mục lưu ảnh mới · Ảnh cũ giữ nguyên vị trí");
@@ -760,19 +861,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 WS_TABSTOP,
             );
             control(hwnd, "BUTTON", "Mở log", LOG, 403, 280, 150, 32, WS_TABSTOP);
-            let auto=control(hwnd,"BUTTON","Tự thêm ảnh vào CapCut khi Ctrl+V (thử nghiệm)",
-                AUTO_ADD,20,320,565,29,BS_AUTOCHECKBOX as u32|WS_TABSTOP);
-            SendMessageW(auto,BM_SETCHECK,1,0);
+            control(hwnd,"STATIC","TÙY CHỌN PASTE TRONG CAPCUT",0,20,317,640,21,0);
+            let auto=control(hwnd,"BUTTON","Tự thêm ảnh vào CapCut khi Ctrl+V",
+                AUTO_ADD,20,342,630,27,BS_AUTOCHECKBOX as u32|WS_TABSTOP);
+            SendMessageW(auto,BM_SETCHECK,if a.import_enabled{1}else{0},0);
+            a.block_checkbox=control(hwnd,"BUTTON",
+                "Chặn Ctrl+V gốc khi thêm ảnh mới (khuyên dùng; tránh dán ảnh cũ)",
+                BLOCK_NATIVE,38,375,630,28,BS_AUTOCHECKBOX as u32|WS_TABSTOP);
+            SendMessageW(a.block_checkbox,BM_SETCHECK,if a.block_native{1}else{0},0);
+            a.clear_checkbox=control(hwnd,"BUTTON",
+                "Clear clipboard Windows sau khi gửi lệnh thêm ảnh (tùy chọn)",
+                CLEAR_AFTER,38,408,630,28,BS_AUTOCHECKBOX as u32|WS_TABSTOP);
+            SendMessageW(a.clear_checkbox,BM_SETCHECK,if a.clear_after_import{1}else{0},0);
             control(hwnd, "BUTTON", "Thoát", EXIT, 575, 280, 95, 32, WS_TABSTOP);
             control(
                 hwnd,
                 "STATIC",
-                "Import ẩn + nút Add-to-Track; không di chuyển con trỏ. Đọc log nếu không chèn được.",
+                "Clear chỉ xóa clipboard Windows sau khi gửi nút +; không xóa Media/PNG cũ.",
                 0,
-                20,
-                357,
-                650,
-                25,
+                38,
+                442,
+                640,
+                26,
                 0,
             );
             a.clipboard_registered = AddClipboardFormatListener(hwnd) != 0;
@@ -796,9 +906,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             let seq=w as u32;
             if !a.paused && a.import_enabled && seq==GetClipboardSequenceNumber() {
                 if let Some((editor,pid))=focused_capcut() {
-                    // The hook suppressed physical Ctrl+V, preventing
-                    // CapCut from pasting its previous internal Media object.
-                    log_event(&a.log_tx,format!("CAPCUT_CTRL_V_SUPPRESSED seq={seq} native_paste_blocked=true"));
+                    log_event(&a.log_tx,format!("CAPCUT_PASTE_ROUTED seq={seq} block_native={} clear_after_import={}",
+                        a.block_native,a.clear_after_import));
                     if a.latest_sequence==Some(seq) {
                         if let Some(path)=a.latest.clone(){
                             enqueue_import(a,editor,pid,seq,path);
@@ -823,6 +932,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     log_event(&a.log_tx,format!(
                         "IMPORT_ADD_COMMAND_SENT seq={sequence} ms={} bbox={},{},{},{} visual_score={:.1} result_not_confirmed",
                         info.elapsed_ms,info.box_.left,info.box_.top,info.box_.right,info.box_.bottom,info.visual_change));
+                    if a.clear_after_import {
+                        match clear_clipboard_if_unchanged(a,sequence) {
+                            Ok(true)=>log_event(&a.log_tx,
+                                format!("CLIPBOARD_CLEARED seq={sequence} after_add_command=true")),
+                            Ok(false)=>log_event(&a.log_tx,
+                                format!("CLIPBOARD_CLEAR_SKIPPED seq={sequence} reason=changed")),
+                            Err(e)=>log_event(&a.log_tx,format!("CLIPBOARD_CLEAR_FAILED seq={sequence} {e}")),
+                        }
+                    }
                     text(a.status,"Đã gửi nút + của Media tới CapCut. Kiểm tra timeline; nếu chưa chèn, gửi log.");
                 }
                 Err(error)=>{
@@ -924,10 +1042,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 COPY => copy_path(&mut *p),
                 AUTO_ADD => {
                     let a=&mut *p;
-                    a.import_enabled=!a.import_enabled;
+                    a.import_enabled=SendMessageW(GetDlgItem(hwnd,AUTO_ADD as i32),BM_GETCHECK,0,0)!=0;
                     PASTE_AUTOMATION.store(!a.paused && a.import_enabled,Ordering::Relaxed);
                     log_event(&a.log_tx,format!("AUTO_ADD enabled={}",a.import_enabled));
                     if !a.import_enabled {a.pending_import=None;}
+                    if let Err(e)=save_preferences(a){log_event(&a.log_tx,format!("PREFS_WRITE_FAILED {e}"));}
+                },
+                BLOCK_NATIVE => {
+                    let a=&mut *p;
+                    a.block_native=SendMessageW(a.block_checkbox,BM_GETCHECK,0,0)!=0;
+                    PASTE_BLOCK_NATIVE.store(a.block_native,Ordering::Relaxed);
+                    log_event(&a.log_tx,format!("BLOCK_NATIVE enabled={}",a.block_native));
+                    if let Err(e)=save_preferences(a){log_event(&a.log_tx,format!("PREFS_WRITE_FAILED {e}"));}
+                },
+                CLEAR_AFTER => {
+                    let a=&mut *p;
+                    a.clear_after_import=SendMessageW(a.clear_checkbox,BM_GETCHECK,0,0)!=0;
+                    log_event(&a.log_tx,format!("CLEAR_AFTER_IMPORT enabled={}",a.clear_after_import));
+                    if let Err(e)=save_preferences(a){log_event(&a.log_tx,format!("PREFS_WRITE_FAILED {e}"));}
                 },
                 LOG => { let path = (*p).log_path.clone(); open_path(hwnd, &path); },
                 PAUSE => pause(&mut *p),
@@ -1034,10 +1166,16 @@ fn main() {
         let (import_tx, import_rx) = mpsc::sync_channel::<ImportJob>(1);
         let log_path = logger_path();
         let (log_tx, log_thread) = start_logger(log_path.clone());
-        log_event(&log_tx, "START version=0.7.2 capcut_mode=hidden_import_add_to_track clipboard_auto_write=false");
+        let preferences=prefs_path();
+        let saved_prefs=load_preferences(&preferences);
+        log_event(&log_tx,format!("START version=0.7.3 auto_add={} block_native={} clear_after_import={}",
+            saved_prefs.auto_add,saved_prefs.block_native,saved_prefs.clear_after_import));
         let mut app = Box::new(App {
             folder,
             config,
+            preferences,
+            block_native: saved_prefs.block_native,
+            clear_after_import: saved_prefs.clear_after_import,
             latest: None,
             latest_sequence: None,
             tx,
@@ -1066,7 +1204,9 @@ fn main() {
             import_tx,
             import_worker: None,
             import_busy: false,
-            import_enabled: true,
+            import_enabled: saved_prefs.auto_add,
+            block_checkbox: null_mut(),
+            clear_checkbox: null_mut(),
             pending_import: None,
             last_import_attempt: None,
         });
@@ -1092,7 +1232,7 @@ fn main() {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             710,
-            410,
+            510,
             null_mut(),
             null_mut(),
             instance,
@@ -1116,8 +1256,10 @@ fn main() {
         window_shadow(hwnd);
         PASTE_TARGET.store(hwnd as isize,Ordering::Relaxed);
         PASTE_AUTOMATION.store(app.import_enabled && !app.paused,Ordering::Relaxed);
+        PASTE_BLOCK_NATIVE.store(app.block_native,Ordering::Relaxed);
         app.keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(paste_observer), instance, 0);
-        log_event(&app.log_tx, format!("PASTE_ROUTER installed={} conditional_suppress=true", !app.keyboard_hook.is_null()));
+        log_event(&app.log_tx, format!("PASTE_ROUTER installed={} conditional_suppress={} optional_clear={}",
+            !app.keyboard_hook.is_null(),app.block_native,app.clear_after_import));
         let target = hwnd as usize;
         let worker_log = log_tx.clone();
         let import_log=log_tx.clone();
