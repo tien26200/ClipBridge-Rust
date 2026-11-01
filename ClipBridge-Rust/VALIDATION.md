@@ -1,4 +1,4 @@
-# ClipBridge Rust v0.8.0 — regression and playhead placement
+# ClipBridge Rust v0.8.1 — regression and playhead placement
 
 ## Two separate issues reported
 (1) New Media rows: the first image in row 2/3/4 appears in Media but
@@ -9,7 +9,15 @@ scans and source-image matching; user's CapCut still showed failures.
 position entirely. The '+' action does not guarantee placement at the
 user's requested time.
 
-## Implementation (v0.8.0)
+## Implementation (v0.8.1)
+
+New-row handling: scanning now allows ±70 pixels horizontal shift as well
+as ±84px vertical shift around Media grid anchors; it only checks boxes
+fully inside the Media view. The source-image matcher collapses correlated
+neighboring search candidates, so a shifted first card should not be
+rejected as many competing cards. A deterministic regression test covers
+first card at (176,402) vs old grid (120,374). This DOES NOT establish
+real CapCut success; test every first card after row wrap.
 - Playhead placement ON by default. Before importing any image, capture
   the full editor IN MEMORY and detect a neutral vertical line PLUS
   corresponding bright marker in the ruler. Require a unique match.
