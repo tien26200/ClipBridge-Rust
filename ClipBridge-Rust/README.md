@@ -1,46 +1,66 @@
-# ClipBridge Rust v0.7.9
+# ClipBridge Rust v0.8.0
 
-## Fix — first image when CapCut Media starts a new row
+Windows clipboard-image capture → named PNG saved immediately at Ctrl+C
+→ CapCut Media import → guarded timeline placement.
 
-The user identified that the FIRST thumbnail in a newly filled Media row
-often imports correctly into Media but is not added to timeline. Previous
-ClipBridge builds assumed all thumbnails stayed on a rigid 136px-by-112px
-grid. CapCut can scroll/reflow the Media panel when a row fills; a changed
-rectangle may not be the newly imported thumbnail.
+## Why v0.7.9 landed clips at the wrong time
 
-v0.7.9:
-1. Adds a bounded ±84px vertical scan in 14px steps around each known
-   Media grid anchor (only fully visible parts of the Media panel).
-2. Scores those candidates against the *actual saved PNG* source, rather
-   than trusting changed pixels alone. It collapses nearby scan offsets
-   from the SAME thumbnail before calculating the confidence margin.
-3. Logs the source match confidence and row offset as numbers, without
-   logging image content or screenshots.
-4. If selecting the new thumbnail causes CapCut to scroll again, re-runs
-   source matching against the CURRENT screen and confirms the selection
-   still belongs to the source before clicking Add (+).
-5. Keeps the exact v0.7.4 low-level Add-to-Track down/up message pair,
-   and the v0.7.8 no-duplicate re-import state machine.
+It never read CapCut's playhead. It sent a click to the Media thumbnail's
+small '+' control; CapCut decided the timeline insertion position.
+Fixing thumbnail detection alone could never enforce playhead alignment.
 
-The algorithm deliberately fails closed on ambiguous or offscreen media
-rather than pressing Add (+) on an older image. No Windows mouse pointer
-movement, no edits to CapCut drafts.
+## v0.8.0 — two explicit placement modes
 
-## Filename when copying images
+**Playhead placement (default ON, experimental):**
+- Read the actual vertical ruler/playhead marker in a full-editor,
+  in-memory screen capture BEFORE importing.
+- Choose a plausible empty timeline video lane near the playhead. Bail out
+  BEFORE importing if the marker or lane cannot be identified safely.
+- Identify the exact new Media image using source-PNG matching and
+  adaptive row-position scanning from v0.7.9; confirm the correct Media
+  thumbnail is selected.
+- Recheck that the playhead has not moved during import and the lane
+  is still safe. Then simulate one window-scoped drag from Media image
+  onto the detected playhead x coordinate. Physical mouse stays still.
+- Compare the small timeline patch after drag and log its change score.
+  A posted drag or a changed patch is NOT proof of successful placement;
+  verify visually in the user's CapCut version.
+- Never fall back silently to the old '+' click when marker detection
+  fails. This prevents known wrong-position additions.
 
-ClipBridge saves PNGs as `TenProject_001_DD-MM-YYYY.png`, numbered per
-project/day when Ctrl+C fires outside CapCut. Existing files are never
-renamed or overwritten. If automatic project detection is not accurate,
-provide a manual name in ClipBridge's window.
+**Legacy Media '+' mode (checkbox OFF):**
+- Keeps the original low-level WM_LBUTTONDOWN / WM_LBUTTONUP message pair
+  for compatibility. CapCut determines placement; it may be at the wrong
+  time. Explicitly opt into this only if you prefer previous behavior.
 
-## Settings
+Neither mode edits the CapCut draft files, moves the physical mouse
+pointer, rewrites Windows clipboard or automatically repeats an
+unverified Add/drag command. The Media Import and no-duplicate retry
+state machine are retained.
 
-- Auto Add on Ctrl+V (ON by default)
-- Block native CapCut Ctrl+V for new copied image (ON by default)
-- Optionally clear Windows Clipboard after sending Add (OFF by default)
-- Circular pink/blue/yellow Windows/tray icon unchanged.
+## PNG filenames
 
-Settings and diagnostic log live in `%LOCALAPPDATA%\ClipBridge`.
-This is Windows GUI automation, not a verified CapCut API.
-A successful test/build is not proof a clip was inserted into timeline.
-Run the checks in `VALIDATION.md` on a disposable CapCut project.
+Each new external image copy is saved to the selected output folder as
+`TenProject_001_DD-MM-YYYY.png`,
+`TenProject_002_DD-MM-YYYY.png`, etc.
+The project name is inferred read-only when possible or entered manually
+in Settings. CapCut's internal asset names are NOT renamed.
+
+## Persistent options
+
+- Auto Add (ON)
+- Block native CapCut Ctrl+V for external images (ON)
+- Clear Windows clipboard after successful Add/drag **command** (OFF)
+- Place at playhead (experimental, ON)
+
+Diagnostic log: `%LOCALAPPDATA%\ClipBridge\clipbridge.log`.
+Settings: `%LOCALAPPDATA%\ClipBridge\preferences.ini`.
+Tri-colour circular Windows/tray icon is unchanged.
+
+### Validation limitations
+
+The app relies on screen pixels and posted window messages, not an official
+CapCut timeline API. Some Qt versions or layouts may ignore synthetic drag,
+and the new mode may choose to stop if playhead or destination is ambiguous.
+Test on a disposable CapCut project. An EXE build and Rust unit tests
+cannot prove real timeline insertion. See VALIDATION.md.
