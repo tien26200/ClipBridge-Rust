@@ -8,7 +8,7 @@ use windows_sys::Win32::{Foundation::*,Graphics::Gdi::*,UI::WindowsAndMessaging:
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub struct MediaBox {pub left:i32,pub top:i32,pub right:i32,pub bottom:i32}
 impl MediaBox {
-    fn overlaps(self, other:Self)->bool {
+    pub(crate) fn overlaps(self, other:Self)->bool {
         self.left<other.right && other.left<self.right &&
         self.top<other.bottom && other.top<self.bottom
     }
@@ -206,6 +206,11 @@ pub fn find_imported_media(before:&Shot,after:&Shot)->Option<(MediaBox,f64)> {
         Some((changed,score))
     }else{None}
 }
+// When importing a second image, CapCut may keep highlighting A.
+// The new B thumbnail must be selected before using the (+) button.
+pub fn needs_select_new_tile(target:MediaBox,current_selection:Option<MediaBox>)->bool{
+    current_selection.is_some_and(|s|!s.overlaps(target))
+}
 pub fn media_diagnostic(before:&Shot,after:&Shot)->String {
     let diffs=ranked_media_changes(before,after);
     let top=diffs.iter().take(3)
@@ -315,6 +320,13 @@ mod tests {
         assert!(got.overlaps(second));
         assert!(!got.overlaps(first));
         assert!((got.right-12-second.right).abs()<20);
+    }
+    #[test] fn selects_new_tile_only_when_old_tile_remains_selected(){
+        let a=MediaBox{left:120,top:150,right:236,bottom:228};
+        let b=MediaBox{left:256,top:150,right:372,bottom:228};
+        assert!(needs_select_new_tile(b,Some(a)));
+        assert!(!needs_select_new_tile(b,Some(b)));
+        assert!(!needs_select_new_tile(b,None));
     }
     #[test] fn calibrated_selected_outline_moves_to_second_item(){
         let slots=media_slots(&blank());
