@@ -50,7 +50,7 @@ unsafe fn owned_dialog(hwnd:HWND,pid:u32)->bool {
     n>0 && String::from_utf16_lossy(&class[..n as usize])=="#32770"
 }
 unsafe fn cloak_dialog(dialog: HWND, editor: HWND) {
-    if !IsWindow(dialog).eq(&0) {return;}
+    if IsWindow(dialog)==0 {return;}
     let ex=GetWindowLongPtrW(dialog,GWL_EXSTYLE);
     SetWindowLongPtrW(dialog,GWL_EXSTYLE,
         ex|(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW) as isize);
