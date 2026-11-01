@@ -341,6 +341,24 @@ static PASTE_AUTOMATION: AtomicBool = AtomicBool::new(false);
 static PASTE_V_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 const WM_PASTE_OBSERVED: u32 = WM_APP + 3;
 
+#[inline]
+fn is_image_paste_eligible(enabled:bool,ready_seq:u32,current_seq:u32)->bool {
+    enabled && ready_seq!=0 && ready_seq==current_seq
+}
+
+#[cfg(test)]
+mod paste_route_tests {
+    use super::is_image_paste_eligible;
+    #[test] fn intercepts_only_current_external_image() {
+        assert!(is_image_paste_eligible(true,2311,2311));
+        assert!(!is_image_paste_eligible(true,2311,2320)); // clipboard changed
+        assert!(!is_image_paste_eligible(true,0,2311));    // CapCut internal copy
+        assert!(!is_image_paste_eligible(false,2311,2311)); // checkbox off
+        assert!(!is_image_paste_eligible(true,0,0));      // no clipboard
+    }
+}
+
+
 unsafe extern "system" fn paste_observer(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if code < 0 {return CallNextHookEx(null_mut(),code,w,l);}
     let k = &*(l as *const KBDLLHOOKSTRUCT);
@@ -368,12 +386,12 @@ unsafe extern "system" fn paste_observer(code: i32, w: WPARAM, l: LPARAM) -> LRE
         // Ignore key repeat for a single physical V press.
         return 1;
     }
-    if key_down
-        && PASTE_AUTOMATION.load(Ordering::Relaxed)
-        && (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000)!=0
-    {
+    if key_down &&
+        (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000)!=0 {
         let seq=GetClipboardSequenceNumber();
-        if seq!=0 && seq==PASTE_IMAGE_SEQ.load(Ordering::Relaxed) {
+        if is_image_paste_eligible(
+            PASTE_AUTOMATION.load(Ordering::Relaxed),
+            PASTE_IMAGE_SEQ.load(Ordering::Relaxed),seq) {
             if focused_capcut().is_some() {
                 let target=PASTE_TARGET.load(Ordering::Relaxed) as HWND;
                 // Only swallow the original keyboard event after it is queued.
