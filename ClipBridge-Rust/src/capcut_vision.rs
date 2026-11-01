@@ -134,6 +134,31 @@ pub(crate) fn media_slots(s:&Shot)->Vec<MediaBox> {
     }
     slots
 }
+// CapCut can scroll/reflow its Media grid when a new row begins. The
+// unshifted 112px row grid is a useful ANCHOR, not a reliable y-coordinate.
+// Search small vertical offsets around every visible anchor. Separate
+// candidates describing the SAME physical card are clustered downstream
+// before confidence margins are calculated (otherwise adjacent offsets
+// appear to be multiple competing "best" cards).
+pub(crate) fn media_search_slots(s:&Shot)->Vec<MediaBox>{
+    let mut result=Vec::new();
+    let media_top=145i32;
+    let media_bottom=(s.h.min(575)) as i32;
+    for slot in media_slots(s) {
+        for shift in (-84i32..=84).step_by(14) {
+            let shifted=MediaBox {
+                left:slot.left, right:slot.right,
+                top:slot.top+shift, bottom:slot.bottom+shift,
+            };
+            if shifted.top>=media_top && shifted.bottom<=media_bottom {
+                // Prevent duplicate scan candidates from adjacent nominal
+                // rows with the exact same shifted rectangle.
+                if !result.contains(&shifted){result.push(shifted);}
+            }
+        }
+    }
+    result
+}
 pub(crate) fn box_score(before:&Shot,after:&Shot,b:MediaBox)->f64 {
     let mut total=0u64;
     let mut count=0u64;
@@ -373,6 +398,18 @@ mod tests {
         draw_rect(&mut after,a,(50,50,50));
         draw_rect(&mut after,b,(50,50,50));
         assert!(find_imported_media(&before,&after).is_none());
+    }
+    #[test] fn searches_first_column_after_new_row_and_vertical_reflow(){
+        let shot=blank();
+        let candidates=media_search_slots(&shot);
+        // Second-row first tile shifts upward by 28px when CapCut scrolls.
+        let expected=MediaBox{left:120,top:234,right:236,bottom:312};
+        assert!(candidates.contains(&expected),"must search shifted row 2 col 1");
+        let third=MediaBox{left:120,top:346,right:236,bottom:424};
+        assert!(candidates.contains(&third),"must search shifted row 3 col 1");
+        let fourth=MediaBox{left:120,top:458,right:236,bottom:536};
+        assert!(candidates.contains(&fourth),"must search shifted row 4 col 1");
+        assert!(candidates.iter().all(|r|r.top>=145 && r.bottom<=575));
     }
     #[test] fn unchanged_media_is_not_clicked() {
         let s=blank(); assert!(find_imported_media(&s,&s).is_none());
