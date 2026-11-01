@@ -285,6 +285,9 @@ unsafe fn capture(app: &mut App) {
                     log_event(&app.log_tx, format!("CAPTURE_ENQUEUED seq={seq} outstanding={} elapsed_ms={}", app.outstanding+1, began.elapsed().as_millis()));
                     app.outstanding += 1;
                     app.last_seq = seq;
+                    // Image metadata can be routed even if PNG encoding has
+                    // not completed; WM_PASTE_OBSERVED waits for WM_SAVED.
+                    PASTE_IMAGE_SEQ.store(seq,Ordering::Relaxed);
                     text(app.status, "Đang lưu ảnh…");
                     app.retries = 0;
                     KillTimer(app.main, 1);
@@ -341,7 +344,18 @@ const WM_PASTE_OBSERVED: u32 = WM_APP + 3;
 unsafe extern "system" fn paste_observer(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if code < 0 {return CallNextHookEx(null_mut(),code,w,l);}
     let k = &*(l as *const KBDLLHOOKSTRUCT);
-    if k.vkCode != b'V' as u32 || (k.flags & LLKHF_INJECTED)!=0 {
+    if (k.flags & LLKHF_INJECTED)!=0 {
+        return CallNextHookEx(null_mut(),code,w,l);
+    }
+    // Preserve CapCut's own Ctrl+C / Ctrl+V, even if its internal copy does
+    // not change the Windows clipboard. A new external copy will re-arm later.
+    if k.vkCode==b'C' as u32 &&
+        (w as u32==WM_KEYDOWN || w as u32==WM_SYSKEYDOWN) &&
+        (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000)!=0 &&
+        focused_capcut().is_some() {
+        PASTE_IMAGE_SEQ.store(0,Ordering::Relaxed);
+    }
+    if k.vkCode != b'V' as u32 {
         return CallNextHookEx(null_mut(),code,w,l);
     }
     let key_down=w as u32==WM_KEYDOWN || w as u32==WM_SYSKEYDOWN;
@@ -801,10 +815,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             0
         }
         WM_CLIPBOARDUPDATE => {
-            let a = &mut *p;
-            let seq = GetClipboardSequenceNumber();
-            if seq != a.last_seq { log_event(&a.log_tx, format!("CLIPBOARD_UPDATE seq={seq} {}", clipboard_metadata())); }
-            a.retries = 0;
+            let a=&mut *p;
+            let seq=GetClipboardSequenceNumber();
+            if seq!=a.last_seq {
+                log_event(&a.log_tx,format!("CLIPBOARD_UPDATE seq={seq} {}",clipboard_metadata()));
+            }
+            // Do not reinterpret CapCut's own Media Ctrl+C as an external
+            // picture for ClipBridge to import. This keeps manual internal
+            // CapCut copy/paste behavior intact.
+            let owner=GetClipboardOwner();
+            let mut owner_pid=0u32;
+            if !owner.is_null(){GetWindowThreadProcessId(owner,&mut owner_pid);}
+            if focused_capcut().is_some_and(|(_,pid)|pid==owner_pid) {
+                PASTE_IMAGE_SEQ.store(0,Ordering::Relaxed);
+                a.last_seq=seq;
+                a.retries=0;
+                a.pending_import=None;
+                KillTimer(hwnd,1);
+                log_event(&a.log_tx,format!("CAPCUT_INTERNAL_COPY_PASS_THROUGH seq={seq}"));
+                return 0;
+            }
+            a.retries=0;
             capture(a);
             0
         }
@@ -843,7 +874,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         }
                     }
                 }
-                Err(e) => { log_event(&a.log_tx, format!("SAVE_ERROR seq={sequence} error={e}")); text(a.status, &format!("Không lưu được ảnh: {e}")); },
+                Err(e) => {
+                    if PASTE_IMAGE_SEQ.load(Ordering::Relaxed)==sequence {
+                        PASTE_IMAGE_SEQ.store(0,Ordering::Relaxed);
+                    }
+                    if a.pending_import.as_ref().is_some_and(|(seq,_,_)|*seq==sequence){
+                        a.pending_import=None;
+                    }
+                    log_event(&a.log_tx,format!("SAVE_ERROR seq={sequence} error={e}"));
+                    text(a.status,&format!("Không lưu được ảnh: {e}"));
+                },
             }
             0
         }
