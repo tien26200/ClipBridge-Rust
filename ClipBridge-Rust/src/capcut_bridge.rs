@@ -4,7 +4,7 @@
 //! Uses no physical cursor motion, no project file edits, no clipboard writes.
 //! Still uses an invisible Windows file chooser and synthetic window messages.
 //! This is NOT a public CapCut API and requires real-version testing.
-use crate::capcut_vision::{capture_media, find_imported_media, MediaBox};
+use crate::capcut_vision::{capture_media, find_imported_media, media_diagnostic, MediaBox};
 use std::{
     mem::{size_of,zeroed},
     os::windows::ffi::OsStrExt,
@@ -306,16 +306,16 @@ pub unsafe fn import_then_add(
     trace("MEDIA_IMPORT_REQUEST_FINISHED");
     let mut found=None;
     let mut candidate:Option<(MediaBox,f64)>=None;
-    let deadline=Instant::now()+Duration::from_millis(2100);
+    let deadline=Instant::now()+Duration::from_millis(3200);
     let mut check_count=0;
+    let mut last_media=None;
     while Instant::now()<deadline {
         if !window_is_editor(editor,job.pid) {break;}
         let after=capture_media(editor)?;
         check_count+=1;
         if let Some((b,score))=find_imported_media(&before,&after) {
-            // After deleting an earlier Media tile, CapCut may reflow the grid
-            // while the next image thumbnail is still loading. Require two
-            // stable observations before sending an Add (+) message.
+            // Two agreeing observations distinguish the actual new image
+            // from CapCut's first-frame selection/thumbnail redraw.
             if let Some((prev,_))=candidate {
                 let stable=(b.left-prev.left).abs()<=8 &&
                     (b.top-prev.top).abs()<=8 &&
@@ -324,6 +324,7 @@ pub unsafe fn import_then_add(
                 if stable {
                     found=Some((b,score));
                     trace("MEDIA_TILE_STABLE confirmed=2");
+                    last_media=Some(after);
                     break;
                 }
             }
@@ -331,10 +332,16 @@ pub unsafe fn import_then_add(
         } else {
             candidate=None;
         }
+        last_media=Some(after);
         thread::sleep(Duration::from_millis(130));
     }
     trace(&format!("MEDIA_CHECKS count={check_count}"));
-    let (box_,score)=found.ok_or("Imported thumbnail could not be identified safely")?;
+    if let Some(ref after)=last_media {
+        // Only bounding boxes, scores and selection coordinates; never
+        // export the user's images or screenshots to log files.
+        trace(&format!("MEDIA_DIAGNOSTIC {}",media_diagnostic(&before,after)));
+    }
+    let (box_,score)=found.ok_or("Imported thumbnail not confidently identified; check MEDIA_DIAGNOSTIC")?;
     trace(&format!("MEDIA_TILE_FOUND x={} y={} diff={score:.1}",box_.right,box_.bottom));
     if !editor_is_foreground(editor) {
         return Err("Focus changed before Add-to-Track; no click sent".into());
