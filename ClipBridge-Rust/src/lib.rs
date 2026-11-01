@@ -1,5 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::{Cursor, Write},
     path::{Path, PathBuf},
@@ -252,6 +253,65 @@ pub fn store_png(bytes: &[u8], folder: &Path) -> Result<PathBuf, String> {
     result
 }
 
+/// Save a copy-time PNG with an immediately useful filename:
+/// project_001_DD-MM-YYYY.png. Never renames media in CapCut and never
+/// overwrites files already saved or linked by existing CapCut projects.
+/// A worker-local counter caches the max index per folder/project/date.
+pub fn store_png_named(
+    bytes: &[u8],
+    folder: &Path,
+    project: &str,
+    date: &str,
+    counters: &mut HashMap<(PathBuf,String,String),u32>,
+) -> Result<PathBuf,String> {
+    if project.is_empty() || date.is_empty() ||
+        project.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\n', '\r']) ||
+        date.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\n', '\r']) {
+        return Err("Tên project hoặc ngày tháng không hợp lệ".into());
+    }
+    fs::create_dir_all(folder).map_err(|e|e.to_string())?;
+    let key=(folder.to_path_buf(),project.to_string(),date.to_string());
+    if !counters.contains_key(&key) {
+        let prefix=format!("{project}_");
+        let suffix=format!("_{date}.png");
+        let mut maximum=0u32;
+        for entry in fs::read_dir(folder).map_err(|e|e.to_string())?.flatten() {
+            let filename=entry.file_name();
+            let Some(name)=filename.to_str().map(str::to_string) else {continue};
+            let Some(number)=name.strip_prefix(&prefix)
+                .and_then(|s|s.strip_suffix(&suffix)) else {continue};
+            if number.len()<3 || number.len()>8 || !number.bytes().all(|b|b.is_ascii_digit()){
+                continue;
+            }
+            if let Ok(index)=number.parse::<u32>() {maximum=maximum.max(index);}
+        }
+        counters.insert(key.clone(),maximum.saturating_add(1).max(1));
+    }
+    for _ in 0..100 {
+        let n=*counters.get(&key).ok_or("File sequence unavailable")?;
+        if n==u32::MAX {return Err("File sequence exhausted".into());}
+        let path=folder.join(format!("{project}_{n:03}_{date}.png"));
+        let write=OpenOptions::new().write(true).create_new(true).open(&path);
+        match write {
+            Ok(mut file)=>{
+                let result=file.write_all(bytes).map_err(|e|e.to_string());
+                drop(file);
+                if let Err(e)=result {
+                    let _=fs::remove_file(&path);
+                    return Err(e);
+                }
+                counters.insert(key,(n+1).max(1));
+                return Ok(path);
+            }
+            Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists =>{
+                counters.insert(key.clone(),n+1);
+            }
+            Err(e)=>return Err(format!("Không thể tạo ảnh mới: {e}")),
+        }
+    }
+    Err("Không tìm được STT tên file trống sau 100 lần kiểm tra".into())
+}
+
 pub fn save_setting(config: &Path, folder: &Path) -> Result<(), String> {
     let text = folder
         .to_str()
@@ -384,6 +444,26 @@ mod tests {
         let new = store_png(&data, &second).unwrap();
         assert!(old.exists() && new.exists());
         assert_eq!(fs::read(old).unwrap(), data);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn named_png_is_numbered_at_copy_time_without_overwriting(){
+        let root=temp();
+        let date="01-11-2026";
+        let mut counter=HashMap::new();
+        let a=store_png_named(b"first",&root,"Spa_Mai",date,&mut counter).unwrap();
+        let b=store_png_named(b"second",&root,"Spa_Mai",date,&mut counter).unwrap();
+        assert_eq!(a.file_name().unwrap(),"Spa_Mai_001_01-11-2026.png");
+        assert_eq!(b.file_name().unwrap(),"Spa_Mai_002_01-11-2026.png");
+        assert_eq!(fs::read(&a).unwrap(),b"first");
+        assert_eq!(fs::read(&b).unwrap(),b"second");
+        let mut restarted=HashMap::new();
+        let c=store_png_named(b"third",&root,"Spa_Mai",date,&mut restarted).unwrap();
+        assert_eq!(c.file_name().unwrap(),"Spa_Mai_003_01-11-2026.png");
+        let other=store_png_named(b"fourth",&root,"Another_Project",date,&mut restarted).unwrap();
+        assert_eq!(other.file_name().unwrap(),"Another_Project_001_01-11-2026.png");
+        let tomorrow=store_png_named(b"new day",&root,"Spa_Mai","02-11-2026",&mut restarted).unwrap();
+        assert_eq!(tomorrow.file_name().unwrap(),"Spa_Mai_001_02-11-2026.png");
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
