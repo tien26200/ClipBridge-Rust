@@ -31,6 +31,7 @@ pub struct ImportJob {
     pub pid: u32,
     pub image: PathBuf,
     pub sequence: u32,
+    pub reuse_media: bool,
 }
 pub struct ImportReport {
     pub box_: MediaBox,
@@ -328,48 +329,66 @@ pub unsafe fn import_then_add(
     // independently identifies B when CapCut still highlights A.
     let source=Reference::from_png(&job.image).ok();
     trace(if source.is_some(){"SOURCE_FINGERPRINT_READY"}else{"SOURCE_FINGERPRINT_UNAVAILABLE using_visual_only"});
-    open_image(editor,job.pid,&job.image,&mut trace)?;
-    trace("MEDIA_IMPORT_REQUEST_FINISHED");
-    let mut found=None;
-    let mut candidate:Option<(MediaBox,f64)>=None;
-    let deadline=Instant::now()+Duration::from_millis(3200);
+    if job.reuse_media {
+        // The same clipboard image was imported on an earlier attempt.
+        // Never open Ctrl+I again: locate its existing Media thumbnail.
+        trace("MEDIA_RETRY_WITHOUT_REIMPORT");
+    } else {
+        open_image(editor,job.pid,&job.image,&mut trace)?;
+        trace("MEDIA_IMPORT_REQUEST_FINISHED");
+    }
+    let mut found:Option<(MediaBox,MediaBox,f64)>=None; // click box, slot, score
+    let mut candidate:Option<(MediaBox,MediaBox,f64)>=None;
+    let deadline=Instant::now()+Duration::from_millis(if job.reuse_media {950}else{2700});
     let mut check_count=0;
     let mut last_media=None;
+    let selected_before=selected_media(&before);
     while Instant::now()<deadline {
-        if !window_is_editor(editor,job.pid) {break;}
+        if !window_is_editor(editor,job.pid){break;}
         let after=capture_media(editor)?;
         check_count+=1;
-        let by_source=source.as_ref().and_then(|s|s.locate(&before,&after));
-        let chosen=if let Some(m)=by_source {
-            Some((m.rect,m.change_score))
-        } else {
-            // Never auto-click a barely changed selected border (the 5.4
-            // score in the user's failed seq579 retry): it may be the old
-            // Media item reselected while the actual B is elsewhere.
-            find_imported_media(&before,&after)
-                .filter(|(_,score)|*score>=12.0)
+        let by_source=source.as_ref().and_then(|s|
+            s.locate(if job.reuse_media {None}else{Some(&before)},&after));
+        // Conservative fallback ONLY when CapCut actually shows a newly
+        // selected card. Diff without a matching source can be a grid
+        // repaint (seen in seq579) rather than the imported B.
+        let visual=if job.reuse_media {None} else {
+            let new_selection=selected_media(&after)
+                .filter(|s|Some(*s)!=selected_before);
+            find_imported_media(&before,&after).and_then(|(rect,score)|{
+                let selected=new_selection?;
+                if score>=20.0 && rect.overlaps(selected) {
+                    Some((selected,selected,score))
+                }else{None}
+            })
         };
-        if let Some((b,score))=chosen {
-            // Two agreeing observations distinguish the actual new image
-            // from CapCut's first-frame selection/thumbnail redraw.
-            if let Some((prev,_))=candidate {
-                let stable=(b.left-prev.left).abs()<=8 &&
-                    (b.top-prev.top).abs()<=8 &&
-                    (b.right-prev.right).abs()<=8 &&
-                    (b.bottom-prev.bottom).abs()<=8;
+        let chosen=if let Some(m)=by_source {
+            Some((m.rect,m.slot,m.change_score,true,m.loss,m.runner_up_loss))
+        } else {
+            visual.map(|(rect,slot,score)|(rect,slot,score,false,0.0,0.0))
+        };
+        if let Some((rect,slot,score,matched,loss,runner))=chosen {
+            if let Some((_,prev_slot,_))=candidate {
+                let stable=(slot.left-prev_slot.left).abs()<=8 &&
+                    (slot.top-prev_slot.top).abs()<=8 &&
+                    (slot.right-prev_slot.right).abs()<=8 &&
+                    (slot.bottom-prev_slot.bottom).abs()<=8;
                 if stable {
-                    found=Some((b,score));
-                    trace("MEDIA_TILE_STABLE confirmed=2");
+                    found=Some((rect,slot,score));
+                    trace(if matched{"MEDIA_SOURCE_MATCH_STABLE"}else{"MEDIA_SELECTED_MATCH_STABLE"});
+                    if matched {
+                        trace(&format!("SOURCE_MATCH_CONFIDENT loss={loss:.2} runner={runner:.2}"));
+                    }
                     last_media=Some(after);
                     break;
                 }
             }
-            candidate=Some((b,score));
-        } else {
+            candidate=Some((rect,slot,score));
+        }else{
             candidate=None;
         }
         last_media=Some(after);
-        thread::sleep(Duration::from_millis(130));
+        thread::sleep(Duration::from_millis(if job.reuse_media{95}else{130}));
     }
     trace(&format!("MEDIA_CHECKS count={check_count}"));
     trace(&format!("SOURCE_MATCHER enabled={} fallback_min_change=12.0",source.is_some()));
@@ -378,8 +397,11 @@ pub unsafe fn import_then_add(
         // export the user's images or screenshots to log files.
         trace(&format!("MEDIA_DIAGNOSTIC {}",media_diagnostic(&before,after)));
     }
-    let (box_,score)=found.ok_or("Imported thumbnail not confidently identified; check MEDIA_DIAGNOSTIC")?;
-    trace(&format!("MEDIA_TILE_FOUND x={} y={} diff={score:.1}",box_.right,box_.bottom));
+    let (box_,slot,score)=found.ok_or(
+        "Exact/new Media item not confidently identified; no Add command sent (see MEDIA_DIAGNOSTIC)"
+    )?;
+    trace(&format!("MEDIA_TILE_FOUND x={} y={} diff={score:.1} slot={},{},{},{} reuse_media={}",
+        box_.right,box_.bottom,slot.left,slot.top,slot.right,slot.bottom,job.reuse_media));
     if !editor_is_foreground(editor) {
         return Err("Focus changed before Add-to-Track; no click sent".into());
     }
@@ -388,11 +410,15 @@ pub unsafe fn import_then_add(
     }
     let mut target=box_;
     let current_selection=last_media.as_ref().and_then(selected_media);
-    if needs_select_new_tile(box_,current_selection) {
+    // Selection NONE also requires selecting the exact imported card before
+    // touching its Add (+) button. That was missing for B in v0.7.7.
+    let must_select=current_selection.is_none() ||
+        needs_select_new_tile(slot,current_selection);
+    if must_select {
         trace("MEDIA_SELECTION_STALE selecting_new_tile=true");
         // Keep the main (+) click unchanged from the user's working 0.7.4.
         // Only perform this preparatory selection for an unselected B/C card.
-        native_select_media_tile(editor,box_)?;
+        native_select_media_tile(editor,slot)?;
         let settle=Instant::now()+Duration::from_millis(720);
         let mut confirmed=false;
         while Instant::now()<settle {
@@ -402,7 +428,7 @@ pub unsafe fn import_then_add(
             }
             let selection_shot=capture_media(editor)?;
             if let Some(selected)=selected_media(&selection_shot) {
-                if selected.overlaps(box_) {
+                if selected.overlaps(slot) {
                     target=selected;
                     confirmed=true;
                     break;
@@ -415,7 +441,7 @@ pub unsafe fn import_then_add(
         }
         trace("MEDIA_SELECT_CONFIRMED target=new_import");
     } else {
-        trace("MEDIA_SELECTION_ALREADY_MATCHED_OR_UNAVAILABLE");
+        trace("MEDIA_SELECTION_MATCHED target=new_import");
     }
     let (x,y)=native_add_to_track(editor,target)?;
     trace(&format!("ADD_TO_TRACK_SENT target=editor client_x={x} client_y={y} result_not_verified"));
