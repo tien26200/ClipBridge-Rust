@@ -363,11 +363,11 @@ pub unsafe fn import_then_add(
             })
         };
         let chosen=if let Some(m)=by_source {
-            Some((m.rect,m.slot,m.change_score,true,m.loss,m.runner_up_loss))
+            Some((m.rect,m.slot,m.change_score,true,m.loss,m.runner_up_loss,m.row_shift))
         } else {
-            visual.map(|(rect,slot,score)|(rect,slot,score,false,0.0,0.0))
+            visual.map(|(rect,slot,score)|(rect,slot,score,false,0.0,0.0,0))
         };
-        if let Some((rect,slot,score,matched,loss,runner))=chosen {
+        if let Some((rect,slot,score,matched,loss,runner,row_shift))=chosen {
             if let Some((_,prev_slot,_))=candidate {
                 let stable=(slot.left-prev_slot.left).abs()<=8 &&
                     (slot.top-prev_slot.top).abs()<=8 &&
@@ -378,6 +378,9 @@ pub unsafe fn import_then_add(
                     trace(if matched{"MEDIA_SOURCE_MATCH_STABLE"}else{"MEDIA_SELECTED_MATCH_STABLE"});
                     if matched {
                         trace(&format!("SOURCE_MATCH_CONFIDENT loss={loss:.2} runner={runner:.2}"));
+                        if row_shift!=0 {
+                            trace(&format!("MEDIA_ROW_REFLOW row_shift_px={row_shift} column_first={}",slot.left<245));
+                        }
                     }
                     last_media=Some(after);
                     break;
@@ -428,7 +431,23 @@ pub unsafe fn import_then_add(
             }
             let selection_shot=capture_media(editor)?;
             if let Some(selected)=selected_media(&selection_shot) {
-                if selected.overlaps(slot) {
+                // A newly selected first-column tile can cause CapCut to
+                // scroll/reflow AGAIN. In that case its screen coordinates
+                // move; verify source content on the current frame instead
+                // of trusting the pre-click slot position.
+                let matched_now=source.as_ref().and_then(|fingerprint|
+                    fingerprint.locate(None,&selection_shot));
+                let right_media=if let Some(m)=matched_now {
+                    selected.overlaps(m.slot)
+                } else {
+                    // Older / unsupported source PNGs have no fingerprint.
+                    // Only accept the original unchanged Media slot then.
+                    source.is_none() && selected.overlaps(slot)
+                };
+                if right_media {
+                    if !selected.overlaps(slot) {
+                        trace("MEDIA_SELECTION_RELOCATED after_row_scroll=true");
+                    }
                     target=selected;
                     confirmed=true;
                     break;
@@ -437,7 +456,7 @@ pub unsafe fn import_then_add(
         }
         if !confirmed {
             trace("MEDIA_SELECT_NOT_CONFIRMED");
-            return Err("New Media tile not selected; refused to click stale Add (+) target".into());
+            return Err("Target media not verified after selection/row reflow; skipped Add (+) to avoid wrong clip".into());
         }
         trace("MEDIA_SELECT_CONFIRMED target=new_import");
     } else {
