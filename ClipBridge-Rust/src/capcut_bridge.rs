@@ -262,11 +262,17 @@ unsafe fn native_add_to_track(editor:HWND,b:MediaBox)
         return Err("Cannot map Add-to-Track button into CapCut editor".into());
     }
     let pos=packed_point(client);
-    // No WM_MOUSEMOVE: it triggers Qt hover redraws and is not part of the
-    // known working Jiandan method. The user's physical cursor stays fixed.
+    // CapCut may only expose the thumbnail's (+) hover target after the
+    // media grid has gained a second item. One targeted window-scoped hover
+    // is sufficient; it never moves the user's physical mouse cursor.
+    if PostMessageW(editor,WM_MOUSEMOVE,0,pos)==0 {
+        return Err("Cannot activate the Media thumbnail hover target".into());
+    }
+    thread::sleep(Duration::from_millis(22));
     if PostMessageW(editor,WM_LBUTTONDOWN,1usize,pos)==0 {
         return Err("Native Add-to-Track mouse-down message was rejected".into());
     }
+    thread::sleep(Duration::from_millis(22));
     if PostMessageW(editor,WM_LBUTTONUP,0,pos)==0 {
         return Err("Native Add-to-Track mouse-up message was rejected".into());
     }
