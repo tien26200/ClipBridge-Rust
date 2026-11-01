@@ -762,7 +762,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     log_event(&a.log_tx,format!(
                         "IMPORT_ADD_COMMAND_SENT seq={sequence} ms={} bbox={},{},{},{} visual_score={:.1} result_not_confirmed",
                         info.elapsed_ms,info.box_.left,info.box_.top,info.box_.right,info.box_.bottom,info.visual_change));
-                    text(a.status,"Đã gửi lệnh Add-to-Track. Hãy kiểm tra ảnh trên timeline CapCut.");
+                    text(a.status,"Đã gửi nút + của Media tới CapCut. Kiểm tra timeline; nếu chưa chèn, gửi log.");
                 }
                 Err(error)=>{
                     log_event(&a.log_tx,format!("IMPORT_FAILED seq={sequence} reason={error}"));
@@ -941,7 +941,7 @@ fn main() {
         let (import_tx, import_rx) = mpsc::sync_channel::<ImportJob>(1);
         let log_path = logger_path();
         let (log_tx, log_thread) = start_logger(log_path.clone());
-        log_event(&log_tx, "START version=0.7.0 capcut_mode=hidden_import_add_to_track clipboard_auto_write=false");
+        log_event(&log_tx, "START version=0.7.1 capcut_mode=hidden_import_add_to_track clipboard_auto_write=false");
         let mut app = Box::new(App {
             folder,
             config,
