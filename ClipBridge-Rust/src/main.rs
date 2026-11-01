@@ -1,7 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use clipbridge::{encode, prepare_folder, save_setting, store_png, Capture, MAX_BYTES};
 mod timeline_bridge;
-use timeline_bridge::{TimelineBridge, UnsupportedCapCutAdapter, PasteResult};
+mod capcut_bridge;
+mod capcut_vision;
+use timeline_bridge::{TimelineBridge, UnsupportedCapCutAdapter};
+use capcut_bridge::ImportJob;
 use std::{
     ffi::{OsStr, OsString},
     fs,
@@ -33,6 +36,8 @@ const EXIT: isize = 107;
 const STATUS: isize = 108;
 const SHOW: isize = 109;
 const LOG: isize = 110;
+const AUTO_ADD: isize = 112;
+const WM_IMPORT_FINISHED: u32 = WM_APP + 4;
 const LOG_LIMIT: u64 = 2 * 1024 * 1024;
 struct Job {
     capture: Capture,
@@ -41,6 +46,10 @@ struct Job {
 }
 struct Saved {
     result: Result<PathBuf, String>,
+    sequence: u32,
+}
+struct ImportComplete {
+    result: Result<capcut_bridge::ImportReport, String>,
     sequence: u32,
 }
 struct App {
@@ -67,6 +76,12 @@ struct App {
     log_path: PathBuf,
     timeline: TimelineBridge<UnsupportedCapCutAdapter>,
     keyboard_hook: HHOOK,
+    import_tx: SyncSender<ImportJob>,
+    import_worker: Option<std::thread::JoinHandle<()>>,
+    import_busy: bool,
+    import_enabled: bool,
+    pending_import: Option<(u32, usize, u32)>,
+    last_import_attempt: Option<Instant>,
 }
 
 // Async diagnostic logging: bounded queue, small single writer, no clipboard payload.
@@ -333,20 +348,52 @@ unsafe extern "system" fn paste_observer(code: i32, w: WPARAM, l: LPARAM) -> LRE
     }
     CallNextHookEx(null_mut(), code, w, l)
 }
-unsafe fn focused_capcut() -> bool {
-    let hwnd = GetForegroundWindow();
-    if hwnd.is_null() { return false; }
-    let mut pid = 0u32;
-    GetWindowThreadProcessId(hwnd, &mut pid);
-    if pid == 0 { return false; }
-    let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-    if process.is_null() { return false; }
-    let mut buffer = [0u16; 1024];
-    let mut size = buffer.len() as u32;
-    let found = QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size) != 0;
-    CloseHandle(process);
-    found && String::from_utf16_lossy(&buffer[..size as usize])
-        .to_ascii_lowercase().ends_with("\\capcut.exe")
+unsafe fn focused_capcut() -> Option<(usize,u32)> {
+    let hwnd=GetForegroundWindow();
+    if hwnd.is_null() {return None;}
+    let mut pid=0u32;
+    GetWindowThreadProcessId(hwnd,&mut pid);
+    if pid==0{return None;}
+    let handle=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,0,pid);
+    if handle.is_null(){return None;}
+    let mut buf=[0u16;1024];
+    let mut size=buf.len() as u32;
+    let ok=QueryFullProcessImageNameW(handle,0,buf.as_mut_ptr(),&mut size)!=0;
+    CloseHandle(handle);
+    if !ok{return None;}
+    let process=String::from_utf16_lossy(&buf[..size as usize]).to_ascii_lowercase();
+    if process.ends_with("\\capcut.exe") || process.ends_with("\\jianyingpro.exe") {
+        Some((hwnd as usize,pid))
+    } else {None}
+}
+unsafe fn enqueue_import(a:&mut App,editor:usize,pid:u32,sequence:u32,path:PathBuf){
+    if a.paused || !a.import_enabled{return;}
+    if a.import_busy {
+        log_event(&a.log_tx,"IMPORT_SKIPPED reason=busy");
+        return;
+    }
+    if a.last_import_attempt.is_some_and(|t|t.elapsed().as_millis()<400) {
+        log_event(&a.log_tx,"IMPORT_SKIPPED reason=cooldown");
+        return;
+    }
+    if GetClipboardSequenceNumber()!=sequence || !path.is_file() {
+        log_event(&a.log_tx,"IMPORT_SKIPPED reason=clipboard_changed_or_file_missing");
+        return;
+    }
+    match a.import_tx.try_send(ImportJob {editor,pid,image:path,sequence}) {
+        Ok(()) => {
+            a.import_busy=true;
+            a.last_import_attempt=Some(Instant::now());
+            log_event(&a.log_tx,format!("IMPORT_QUEUED seq={sequence} pid={pid}"));
+            text(a.status,"Đang đưa ảnh vào CapCut Media rồi thêm vào timeline…");
+        }
+        Err(mpsc::TrySendError::Full(_))=>{
+            log_event(&a.log_tx,"IMPORT_QUEUE_FULL");
+        }
+        Err(_)=>{
+            log_event(&a.log_tx,"IMPORT_WORKER_UNAVAILABLE");
+        }
+    }
 }
 
 unsafe fn choose_folder(hwnd: HWND) -> Option<PathBuf> {
@@ -654,11 +701,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 WS_TABSTOP,
             );
             control(hwnd, "BUTTON", "Mở log", LOG, 403, 280, 150, 32, WS_TABSTOP);
+            let auto=control(hwnd,"BUTTON","Tự thêm ảnh vào CapCut khi Ctrl+V (thử nghiệm)",
+                AUTO_ADD,20,320,565,29,BS_AUTOCHECKBOX as u32|WS_TABSTOP);
+            SendMessageW(auto,BM_SETCHECK,1,0);
             control(hwnd, "BUTTON", "Thoát", EXIT, 575, 280, 95, 32, WS_TABSTOP);
             control(
                 hwnd,
                 "STATIC",
-                "Timeline adapter: chưa kích hoạt. Ctrl+V hoạt động bình thường.",
+                "Import ẩn + nút Add-to-Track; không di chuyển con trỏ. Đọc log nếu không chèn được.",
                 0,
                 20,
                 357,
@@ -683,10 +733,41 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             0
         }
         WM_PASTE_OBSERVED => {
-            let a = &mut *p;
-            if !a.paused && focused_capcut() {
-                let result = a.timeline.on_paste();
-                log_event(&a.log_tx, format!("CAPCUT_PASTE_OBSERVED result={result:?} hook_pass_through=true"));
+            let a=&mut *p;
+            if !a.paused && a.import_enabled {
+                if let Some((editor,pid))=focused_capcut() {
+                    let seq=GetClipboardSequenceNumber();
+                    // Do not hijack a later text copy or CapCut's internal media copy.
+                    if a.latest_sequence==Some(seq) {
+                        if let Some(path)=a.latest.clone(){
+                            enqueue_import(a,editor,pid,seq,path);
+                        }
+                    } else if a.outstanding>0 && a.last_seq==seq {
+                        a.pending_import=Some((seq,editor,pid));
+                        log_event(&a.log_tx,format!("IMPORT_AWAITING_SAVE seq={seq}"));
+                    } else {
+                        log_event(&a.log_tx,"PASTE_PASSTHROUGH reason=clipboard_not_latest_image");
+                    }
+                }
+            }
+            0
+        }
+        WM_IMPORT_FINISHED => {
+            let complete=Box::from_raw(l as *mut ImportComplete);
+            let a=&mut *p;
+            a.import_busy=false;
+            let ImportComplete {result,sequence}=*complete;
+            match result {
+                Ok(info)=>{
+                    log_event(&a.log_tx,format!(
+                        "IMPORT_ADD_COMMAND_SENT seq={sequence} ms={} bbox={},{},{},{} visual_score={:.1} result_not_confirmed",
+                        info.elapsed_ms,info.box_.left,info.box_.top,info.box_.right,info.box_.bottom,info.visual_change));
+                    text(a.status,"Đã gửi lệnh Add-to-Track. Hãy kiểm tra ảnh trên timeline CapCut.");
+                }
+                Err(error)=>{
+                    log_event(&a.log_tx,format!("IMPORT_FAILED seq={sequence} reason={error}"));
+                    text(a.status,&format!("Chưa chèn được ảnh: {error}. Xem log."));
+                }
             }
             0
         }
@@ -721,7 +802,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         a.latest_sequence = Some(sequence);
                         log_event(&a.log_tx, format!("SAVE_OK seq={sequence} filename={} clipboard_current_seq={} unchanged_by_app=true", path.file_name().unwrap_or_default().to_string_lossy(), GetClipboardSequenceNumber()));
                         text(a.status, &format!("Đã lưu PNG: {} (giữ clipboard ảnh gốc)", path.display()));
-                        a.timeline.on_image_saved(sequence, path);
+                        a.timeline.on_image_saved(sequence, path.clone());
+                        if let Some((wanted,editor,pid))=a.pending_import.take(){
+                            if wanted==sequence {
+                                enqueue_import(a,editor,pid,sequence,path);
+                            }
+                        }
                     }
                 }
                 Err(e) => { log_event(&a.log_tx, format!("SAVE_ERROR seq={sequence} error={e}")); text(a.status, &format!("Không lưu được ảnh: {e}")); },
@@ -745,6 +831,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     open_path(hwnd, &folder);
                 }
                 COPY => copy_path(&mut *p),
+                AUTO_ADD => {
+                    let a=&mut *p;
+                    a.import_enabled=!a.import_enabled;
+                    log_event(&a.log_tx,format!("AUTO_ADD enabled={}",a.import_enabled));
+                    if !a.import_enabled {a.pending_import=None;}
+                },
                 LOG => { let path = (*p).log_path.clone(); open_path(hwnd, &path); },
                 PAUSE => pause(&mut *p),
                 SHOW => show(&*p),
@@ -845,9 +937,10 @@ fn main() {
             LR_SHARED,
         ) as HICON;
         let (tx, rx) = mpsc::sync_channel::<Job>(1);
+        let (import_tx, import_rx) = mpsc::sync_channel::<ImportJob>(1);
         let log_path = logger_path();
         let (log_tx, log_thread) = start_logger(log_path.clone());
-        log_event(&log_tx, "START version=0.6.0 timeline_adapter=unsupported clipboard_auto_write=false");
+        log_event(&log_tx, "START version=0.7.0 capcut_mode=hidden_import_add_to_track clipboard_auto_write=false");
         let mut app = Box::new(App {
             folder,
             config,
@@ -876,6 +969,12 @@ fn main() {
             log_path,
             timeline: TimelineBridge::new(UnsupportedCapCutAdapter),
             keyboard_hook: null_mut(),
+            import_tx,
+            import_worker: None,
+            import_busy: false,
+            import_enabled: true,
+            pending_import: None,
+            last_import_attempt: None,
         });
         let class = wide("ClipBridgeRustWindow");
         let wc = WNDCLASSW {
@@ -926,6 +1025,20 @@ fn main() {
         log_event(&app.log_tx, format!("PASTE_OBSERVER installed={} passive=true", !app.keyboard_hook.is_null()));
         let target = hwnd as usize;
         let worker_log = log_tx.clone();
+        let import_log=log_tx.clone();
+        app.import_worker=Some(std::thread::spawn(move || {
+            for job in import_rx {
+                let seq=job.sequence;
+                log_event(&import_log,format!("IMPORT_STARTED seq={seq}"));
+                let result=capcut_bridge::import_then_add(&job, |step| {
+                    log_event(&import_log,format!("IMPORT_STEP seq={seq} {step}"));
+                });
+                let raw=Box::into_raw(Box::new(ImportComplete {result,sequence:seq}));
+                if PostMessageW(target as HWND,WM_IMPORT_FINISHED,0,raw as isize)==0{
+                    drop(Box::from_raw(raw));
+                }
+            }
+        }));
         app.worker = Some(std::thread::spawn(move || {
             for job in rx {
                 let start = Instant::now();
@@ -951,14 +1064,17 @@ fn main() {
                 DispatchMessageW(&msg);
             }
         }
-        let worker = app.worker.take();
+        let worker=app.worker.take();
+        let import_worker=app.import_worker.take();
         drop(app);
-        if let Some(worker) = worker {
-            let _ = worker.join();
-        }
+        if let Some(worker)=worker {let _=worker.join();}
+        if let Some(worker)=import_worker {let _=worker.join();}
         // Drain worker results that arrived during shutdown without leaking allocations.
-        while PeekMessageW(&mut msg, hwnd, WM_SAVED, WM_SAVED, PM_REMOVE) != 0 {
+        while PeekMessageW(&mut msg, hwnd, WM_SAVED, WM_SAVED, PM_REMOVE)!=0 {
             drop(Box::from_raw(msg.lParam as *mut Saved));
+        }
+        while PeekMessageW(&mut msg, hwnd, WM_IMPORT_FINISHED, WM_IMPORT_FINISHED, PM_REMOVE)!=0 {
+            drop(Box::from_raw(msg.lParam as *mut ImportComplete));
         }
         if com >= 0 {
             CoUninitialize();
